@@ -1,25 +1,34 @@
 from leduc_env import LeducEnv
 import numpy as np
 
-def decode_one_hot(array):
+def decode_one_hot_card(array):
     mapping = ['J', 'Q', 'K']
     index = None if not np.any(array) else int(np.argmax(array))
     return None if index is None else mapping[index]
 
-def decode_observation(obs):
-    player_hand = decode_one_hot(obs[0:3])
-    community_card = decode_one_hot(obs[3:6])
+def decode_one_hot_stake(array):
+    mapping = list(range(1,15))
+    index = None if not np.any(array) else int(np.argmax(array))
+    return 0 if index is None else mapping[index]
 
-    return player_hand, community_card
+def decode_observation(obs):
+    player_hand = decode_one_hot_card(obs[0:3])
+    community_card = decode_one_hot_card(obs[3:6])
+    current_player_stake = decode_one_hot_stake(obs[6:20])
+    other_player_stake = decode_one_hot_stake(obs[20:34])
+
+    return player_hand, community_card, current_player_stake, other_player_stake
 
 def print_obs(obs, v):
     if not v:
         return
     
-    player_hand, community_card = decode_observation(obs)
+    player_hand, community_card, current_player_stake, other_player_stake = decode_observation(obs)
         
     print(f"Current Player’s Hand: {player_hand}")
     print(f"Community Card: {community_card}")
+    print(f"Current Player has commited {current_player_stake} chips to the pot")
+    print(f"Other Player has commited {other_player_stake} chips to the pot")
 
 def print_mask(mask, v):
     if not v:
@@ -35,17 +44,20 @@ def print_action(action, v):
     
     action_mapping = ['Call', 'Raise', 'Fold', 'Check']
     print(f"Chosen action: {action_mapping[action]}")
+    print("-" * 40)
 
 def main():
     verbose = True
     env = LeducEnv()
 
+    marl_agents = ["player_0", "player_1"]
+
     games = 3
     for _ in range(games):
         done = False
         while not done:
-            for agent in env.AGENTS:
-                observation, mask, reward, done = env.last()
+            for agent in marl_agents:
+                observation, mask, done = env.last()
 
                 if done:
                     action = None
@@ -58,10 +70,13 @@ def main():
                     
                     print_action(action, verbose)
 
-                next_obs, reward = env.step(action)
-                print(f"Agent: {agent} received reward {reward}")
-                print("-" * 40)
+                next_obs = env.step(action)
                     
+        reward_p0, reward_p1 = env.get_rewards()
+        print(f"{marl_agents[0]} reward: {reward_p0}\n{marl_agents[1]} reward: {reward_p1}")
+        print("-" * 40)
+        # Reverse order
+        marl_agents[0], marl_agents[1] = marl_agents[1], marl_agents[0]
         env.reset()
 
 
