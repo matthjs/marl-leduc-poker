@@ -10,10 +10,8 @@ class LeducEnv:
     """
     Two-player Leduc Hold'em environment
     """
-    ACTIONS = ["Call", "Raise", "Fold", "Check"]
     RANKS   = ["J", "Q", "K"]
 
-    
     def __init__(self):
         self.reset()
     
@@ -30,6 +28,8 @@ class LeducEnv:
         self.stage = 0 # 0 = preflop, 1 = postflop
         self.current = 0 # current player to act
         self.terminal = False
+        self.illegal = False
+        self.wrong_doer = None
         self.winner = None
         self.history = [] # Required for betting round logic
 
@@ -41,8 +41,11 @@ class LeducEnv:
         return self.get_observation(), self.get_mask(), self.terminal
         
     def step(self, action):
-        if action is not None:
-            assert action in self.legal_actions()
+        if action is not None and action not in self.legal_actions():
+            self.terminal = True
+            self.illegal = True
+            self.wrong_doer = self.current
+            return
 
         player = self.current
         opponent = 1 - player
@@ -119,6 +122,10 @@ class LeducEnv:
         return np.array([1 if r == rank else 0 for r in self.RANKS], dtype=np.float32)
 
     def get_rewards(self):
+        if self.illegal:
+            r = [0.0, 0.0]
+            r[self.wrong_doer] = -1.0
+            return r
         if self.winner is None:
             return [0.0, 0.0]
         else:
