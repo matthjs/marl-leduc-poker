@@ -44,14 +44,13 @@ class DreamAgent:
         self.buffer = AdvantageBuffer()
         self.advantage_coeff = advantage_coeff
         self.max_grad_norm = max_grad_norm
-        self.eps = 0.10  # ε-greedy exploration; decay it in your main loop
+        self.eps = 0.10  
 
         # Average-policy tables
         self.strategy_sum: Dict[bytes, np.ndarray] = {}
         self.strategy_visits: Dict[bytes, int] = {}
 
     # ---------- Acting ----------
-
     def policy(self, obs: np.ndarray, mask: np.ndarray, use_average: bool = True) -> np.ndarray:
         """Return a prob. dist. over actions for one observation."""
         key = obs.tobytes()
@@ -75,7 +74,7 @@ class DreamAgent:
     def outcome_sampling_traj(self, env, player_i: int, opponent: "DreamAgent" | None = None) -> float:
         """
         Generate one outcome-sampled trajectory and push (s, a, G) samples
-        for states where player_i acted. Opponent uses its *average* policy.
+        for states where player_i acted. Opponent uses its average policy.
         """
         env.reset()
         obs = env.get_observation()
@@ -106,8 +105,8 @@ class DreamAgent:
             if p_s != player_i:
                 continue
             self.buffer.push(AdvantageSample(
-                obs=obs_s,
-                mask=mask_s.astype(np.float32),
+                obs=obs_s.astype(np.float32, copy=False),
+                mask=mask_s.astype(np.float32, copy=False),
                 action=int(a_s),
                 ret_g=payoff,
             ))
@@ -119,29 +118,50 @@ class DreamAgent:
         return payoff
 
     # ---------- Training ----------
-
+    
     def train_step(self, batch_size: int = 2048):
         if len(self.buffer) == 0:
             return {"loss": 0.0, "adv_mse": 0.0, "baseline_mse": 0.0}
 
         batch = self.buffer.sample(batch_size)
-        obs  = torch.tensor(np.stack([b.obs    for b in batch], axis=0), dtype=torch.float32, device=self.device)
-        acts = torch.tensor(np.array([b.action for b in batch]),        dtype=torch.long,    device=self.device)
-        rets = torch.tensor(np.array([b.ret_g  for b in batch]),        dtype=torch.float32, device=self.device)
 
-        # Baseline learns to predict the return G
-        pred_b = self.baseline(obs)  # [B]
+
+        obs_np  = np.stack([b.obs    for b in batch], axis=0).astype(np.float32, copy=False)
+        acts_np = np.asarray([b.action for b in batch], dtype=np.int64)
+        rets_np = np.asarray([b.ret_g  for b in batch], dtype=np.float32)
+
+        obs  = torch.from_numpy(obs_np)
+        acts = torch.from_numpy(acts_np)
+        rets = torch.from_numpy(rets_np)
+
+        if self.device.type == "cuda":
+            obs  = obs.pin_memory().to(self.device, non_blocking=True)
+            acts = acts.pin_memory().to(self.device, non_blocking=True)
+            rets = rets.pin_memory().to(self.device, non_blocking=True)
+        else:
+            obs  = obs.to(self.device)
+            acts = acts.to(self.device)
+            rets = rets.to(self.device)
+
+        # ---- Baseline & losses ----
+        # Ensure BaselineNet returns shape [B]; if it returns [B,1], squeeze it.
+        pred_b = self.baseline(obs)                  # [B] or [B,1]
+        if pred_b.dim() == 2 and pred_b.size(-1) == 1:
+            pred_b = pred_b.squeeze(-1)              # -> [B]
+
         baseline_loss = F.smooth_l1_loss(pred_b, rets)
 
-        # Advantage target uses a detached baseline
+        # Advantage target (no grad graph)
         with torch.no_grad():
-            adv_target = (rets - pred_b.detach()).clamp(-self.adv_clip, self.adv_clip)  # [B]
+            adv_target = (rets - pred_b).clamp(-self.adv_clip, self.adv_clip)  # [B]
 
-        pred_adv_all    = self.adv_net(obs)                               # [B, A]
+        # Advantage regression only on chosen action
+        pred_adv_all    = self.adv_net(obs)                                  # [B, A]
         pred_adv_chosen = pred_adv_all.gather(1, acts.unsqueeze(1)).squeeze(1)  # [B]
         adv_loss = F.smooth_l1_loss(pred_adv_chosen, adv_target)
 
         loss = self.advantage_coeff * adv_loss + baseline_loss
+
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
         nn.utils.clip_grad_norm_(
@@ -156,12 +176,12 @@ class DreamAgent:
             "baseline_mse": float(baseline_loss.item()),
         }
 
+
     # ---------- Internals ----------
 
     def _rm_from_net(self, obs: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """Regret-matching over positive advantages from the net."""
-        o = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
-        with torch.no_grad():
-            adv = self.adv_net(o).squeeze(0).cpu().numpy()  # [A]
+        o = torch.from_numpy(obs.astype(np.float32, copy=False)).unsqueeze(0).to(self.device)
+        with torch.inference_mode():
+            adv = self.adv_net(o).squeeze(0).cpu().numpy()
         pos = np.maximum(adv, 0.0).astype(np.float32)
         return normalize_masked(pos, mask)

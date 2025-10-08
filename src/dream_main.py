@@ -85,7 +85,10 @@ def evaluate_both_seats(env_cls, a0, a1, episodes=400):
 
 # ---------- Training ----------
 
-def main(seed=42, iters=5000, trajs_per_iter=64, batch_size=2048, device="cpu"):
+def main(seed=42, iters=5000, trajs_per_iter=64, batch_size=4096, device=None):
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
     set_seed(seed)
     env = LeducEnv()
     obs_dim = env.get_observation().shape[0]
@@ -153,9 +156,10 @@ def main(seed=42, iters=5000, trajs_per_iter=64, batch_size=2048, device="cpu"):
     print("\n" + "="*80)
     print(f"Training completed in {total_time:.1f}s")
     print("="*80)
-
-    single = evaluate(LeducEnv, agent0, agent1, episodes=1000)
-    both   = evaluate_both_seats(LeducEnv, agent0, agent1, episodes=1000)
+    
+    with torch.no_grad():
+        single = evaluate(LeducEnv, agent0, agent1, episodes=1000)
+        both   = evaluate_both_seats(LeducEnv, agent0, agent1, episodes=1000)
 
     sp0, sp1, st = pct_triple(single)
     ap0, ap1, at = pct_triple(both)
