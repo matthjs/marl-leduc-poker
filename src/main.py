@@ -4,6 +4,7 @@ import numpy as np
 from algorithms.cfgagent import CFRPlusSolver
 from environment.leduc_env import LeducEnv
 from algorithms.cfragent import CFRPlusAgent
+from src.environment.leduc_env_usage import decode_observation
 
 def test_cfr_plus():
     """Comprehensive test of CFR+ implementation"""
