@@ -46,9 +46,11 @@ class DreamAgent:
         self.max_grad_norm = max_grad_norm
         self.eps = 0.10  
 
-        # Average-policy tables
+        # cumulative 
         self.strategy_sum: Dict[bytes, np.ndarray] = {}
-        self.strategy_visits: Dict[bytes, int] = {}
+        # cumulative reach weight
+        self.strategy_w: Dict[bytes, float] = {}
+
 
     # ---------- Acting ----------
     def policy(self, obs: np.ndarray, mask: np.ndarray, use_average: bool = True) -> np.ndarray:
@@ -56,8 +58,8 @@ class DreamAgent:
         key = obs.tobytes()
         if use_average and key in self.strategy_sum:
             s = self.strategy_sum[key]
-            n = max(1, self.strategy_visits.get(key, 1))
-            dist = s / float(n)
+            w = max(1e-12, self.strategy_w.get(key, 0.0))
+            dist = s / w
             return normalize_masked(dist, mask)
         # fallback: regret-matching from current net
         return self._rm_from_net(obs, mask)
@@ -74,23 +76,52 @@ class DreamAgent:
     def outcome_sampling_traj(self, env, player_i: int, opponent: "DreamAgent" | None = None) -> float:
         """
         Generate one outcome-sampled trajectory and push (s, a, G) samples
-        for states where player_i acted. Opponent uses its average policy.
+        for states where player_i acted. Accumulate average policy with opponent
+        reach weights π^{-i}(I). (Chance reach is omitted here.)
         """
         env.reset()
         obs = env.get_observation()
         mask = env.get_mask()
         done = env.terminal
-        traj: List[Tuple[np.ndarray, np.ndarray, int, int]] = []
+
+        # Opponent reach prob up to current node (product of opponent action probs taken so far)
+        opp_reach = 1.0
+
+        traj = []  # will store (obs, mask, p, a, opp_reach_at_state)
 
         while not done:
             p = env.current
-            if p == player_i:
-                a = self.act(obs, mask, use_average=False)
-            else:
-                a = opponent.act(obs, mask, use_average=True) if opponent is not None \
-                    else self.act(obs, mask, use_average=True)
 
-            traj.append((obs.copy(), mask.copy(), p, a))
+            if p == player_i:
+                opp_w_here = opp_reach
+                a = self.act(obs, mask, use_average=False)
+                traj.append((obs.copy(), mask.copy(), p, a, opp_w_here))
+            else:
+                # Build opponent's sampling distribution (their average policy, optionally with eps)
+                legal = np.where(mask > 0)[0]
+                if opponent is not None:
+                    base = opponent.policy(obs, mask, use_average=True) 
+                    if opponent.eps > 0 and len(legal) > 0:
+                        unif = np.zeros_like(base, dtype=np.float32)
+                        unif[legal] = 1.0 / len(legal)
+                        dist = (1.0 - opponent.eps) * base + opponent.eps * unif
+                    else:
+                        dist = base
+                else:
+                    base = self.policy(obs, mask, use_average=True)
+                    if self.eps > 0 and len(legal) > 0:
+                        unif = np.zeros_like(base, dtype=np.float32)
+                        unif[legal] = 1.0 / len(legal)
+                        dist = (1.0 - self.eps) * base + self.eps * unif
+                    else:
+                        dist = base
+
+                # sample opponent action from that dist 
+                a = int(np.random.choice(legal, p=dist[legal]))
+                opp_reach *= float(dist[a])
+
+                traj.append((obs.copy(), mask.copy(), p, a, None))  # no opp weight needed for opponent nodes
+
             _ = env.step(a)
             done = env.terminal
             if not done:
@@ -100,20 +131,29 @@ class DreamAgent:
         r0, r1 = env.get_rewards()
         payoff = float([r0, r1][player_i])
 
-        # Store samples and update avg policy tables
-        for obs_s, mask_s, p_s, a_s in traj:
+        # Store samples for learner updates + update reach-weighted average policy
+        for obs_s, mask_s, p_s, a_s, opp_w in traj:
             if p_s != player_i:
                 continue
+
+            # replay sample for supervised advantage/baseline learning
             self.buffer.push(AdvantageSample(
                 obs=obs_s.astype(np.float32, copy=False),
                 mask=mask_s.astype(np.float32, copy=False),
                 action=int(a_s),
                 ret_g=payoff,
             ))
-            rm = self._rm_from_net(obs_s, mask_s)
+
+            # update cumulative average
+            rm = self._rm_from_net(obs_s, mask_s)  
             key = obs_s.tobytes()
-            self.strategy_sum[key] = self.strategy_sum.get(key, np.zeros(self.act_dim, dtype=np.float32)) + rm
-            self.strategy_visits[key] = self.strategy_visits.get(key, 0) + 1
+            w = float(opp_w) 
+
+            if key not in self.strategy_sum:
+                self.strategy_sum[key] = np.zeros(self.act_dim, dtype=np.float32)
+                self.strategy_w[key] = 0.0
+            self.strategy_sum[key] += w * rm
+            self.strategy_w[key] += w
 
         return payoff
 
