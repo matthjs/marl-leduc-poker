@@ -48,41 +48,28 @@ def fmt_pair_counts(buf0, buf1):
     return f"{k(buf0)}/{k(buf1)}"
 
 
-# ---------- Disable exploration ----------
-@contextmanager
-def disable_exploration(*agents):
-    old_eps = [ag.eps for ag in agents]
-    try:
-        for ag in agents:
-            ag.eps = 0.0
-        yield
-    finally:
-        for ag, e in zip(agents, old_eps):
-            ag.eps = e
-
 
 # ---------- Evaluation ----------
 @torch.inference_mode()
 def evaluate(env_cls, agent_p0, agent_p1, episodes=200):
     wins = np.zeros(3, dtype=int)  # [P0, P1, tie]
-    with disable_exploration(agent_p0, agent_p1):
-        for _ in range(episodes):
-            env = env_cls()
-            env.reset()
+    for _ in range(episodes):
+        env = env_cls()
+        env.reset()
+        done = env.terminal
+        while not done:
+            obs = env.get_observation()
+            mask = env.get_mask()
+            if env.current == 0:
+                a = agent_p0.act(obs, mask, use_average=True)
+            else:
+                a = agent_p1.act(obs, mask, use_average=True)
+            _ = env.step(a)
             done = env.terminal
-            while not done:
-                obs = env.get_observation()
-                mask = env.get_mask()
-                if env.current == 0:
-                    a = agent_p0.act(obs, mask, use_average=True)
-                else:
-                    a = agent_p1.act(obs, mask, use_average=True)
-                _ = env.step(a)
-                done = env.terminal
-            r0, r1 = env.get_rewards()
-            if r0 > r1: wins[0] += 1
-            elif r1 > r0: wins[1] += 1
-            else: wins[2] += 1
+        r0, r1 = env.get_rewards()
+        if r0 > r1: wins[0] += 1
+        elif r1 > r0: wins[1] += 1
+        else: wins[2] += 1
     return wins
 
 
@@ -106,10 +93,9 @@ def evaluate_both_seats(env_cls, a0, a1, episodes=400):
             else: w[2]+=1
         return w
 
-    with disable_exploration(a0, a1):
-        half = episodes // 2
-        wA = one_side(a0, a1, half)
-        wB = one_side(a1, a0, half)
+    half = episodes // 2
+    wA = one_side(a0, a1, half)
+    wB = one_side(a1, a0, half)
     return np.array([wA[0] + wB[1], wA[1] + wB[0], wA[2] + wB[2]])
 
 
@@ -129,27 +115,26 @@ def policy_always_raise(obs, mask):
 @torch.inference_mode()
 def evaluate_vs_fixed(env_cls, agent, opponent_policy, episodes=300, agent_seat=0):
     scores = np.zeros(3, dtype=int)
-    with disable_exploration(agent):
-        for _ in range(episodes):
-            env = env_cls()
-            env.reset()
+    for _ in range(episodes):
+        env = env_cls()
+        env.reset()
+        done = env.terminal
+        while not done:
+            obs = env.get_observation()
+            mask = env.get_mask()
+            if env.current == agent_seat:
+                a = agent.act(obs, mask, use_average=True)
+            else:
+                a = opponent_policy(obs, mask)
+            _ = env.step(a)
             done = env.terminal
-            while not done:
-                obs = env.get_observation()
-                mask = env.get_mask()
-                if env.current == agent_seat:
-                    a = agent.act(obs, mask, use_average=True)
-                else:
-                    a = opponent_policy(obs, mask)
-                _ = env.step(a)
-                done = env.terminal
 
-            r0, r1 = env.get_rewards()
-            agent_r = r0 if agent_seat == 0 else r1
-            opp_r   = r1 if agent_seat == 0 else r0
-            if agent_r > opp_r: scores[0] += 1
-            elif opp_r > agent_r: scores[1] += 1
-            else: scores[2] += 1
+        r0, r1 = env.get_rewards()
+        agent_r = r0 if agent_seat == 0 else r1
+        opp_r   = r1 if agent_seat == 0 else r0
+        if agent_r > opp_r: scores[0] += 1
+        elif opp_r > agent_r: scores[1] += 1
+        else: scores[2] += 1
     return scores
 
 @torch.inference_mode()
@@ -162,7 +147,7 @@ def evaluate_vs_fixed_both_seats(env_cls, agent, opponent_policy, episodes=600):
 # ---------- Training ----------
 def main(
     seed=42,
-    iters=1000,
+    iters=2000,
     trajs_per_iter=64,
     batch_size=4096,
     device=None,
@@ -179,12 +164,15 @@ def main(
     # Agents
     agent0 = DreamAgent(
         obs_dim, act_dim,
-        lr=5e-4, lr_q=5e-4, device=device,
+        lr=5e-4, lr_q=1e-4, device=device,
     )
     agent1 = DreamAgent(
         obs_dim, act_dim,
-        lr=5e-4, lr_q=5e-4, device=device,
+        lr=5e-4, lr_q=1e-4, device=device,
     )
+
+    agent0.use_avg_net = True
+    agent1.use_avg_net = True
 
     # Sync initialization
     agent1.adv_net.load_state_dict(agent0.adv_net.state_dict())
@@ -197,15 +185,12 @@ def main(
     log_every = max(1, iters // 50)
     t0 = time.time()
 
-    print(" iter  |   time   |  eps  |   loss0   loss1  | buffers   |"
+    print(" iter  |   time   | loss0   loss1  | buffers   |"
           "   single-seat P0/P1/T (cnt)   |    seat-avg A0/A1/T (cnt)")
     print("-"*100)
 
     for it in range(1, iters + 1):
-        # ε-decay
-        agent0.eps = max(0.005, 0.10 * (1.0 - it / 2000.0))
-        agent1.eps = max(0.005, 0.10 * (1.0 - it / 2000.0))
-
+        
         # Refresh frozen opponents
         if it % 50 == 0:
             opp0 = AvgPolicyOpponent(agent1)
@@ -213,9 +198,6 @@ def main(
 
         # Data collection
         for _ in range(trajs_per_iter):
-            old_eps0, old_eps1 = agent0.eps, agent1.eps
-            agent0.eps = max(0.25, agent0.eps)
-            agent1.eps = max(0.25, agent1.eps)
 
             if np.random.rand() < 0.5:
                 agent0.outcome_sampling_traj(roll_env0, player_i=0, opponent=opp0)
@@ -224,7 +206,6 @@ def main(
                 agent0.outcome_sampling_traj(roll_env0, player_i=1, opponent=opp0)
                 agent1.outcome_sampling_traj(roll_env1, player_i=0, opponent=opp1)
 
-            agent0.eps, agent1.eps = old_eps0, old_eps1
 
         # Train
         m0 = agent0.train_step(batch_size=batch_size)
@@ -241,7 +222,7 @@ def main(
                 single = evaluate(LeducEnv, agent0, agent1, episodes=120)
                 both = evaluate_both_seats(LeducEnv, agent0, agent1, episodes=240)
             print(
-                f"[{it:05d}] | {elapsed:7.1f}s | {agent0.eps:4.2f} | "
+                f"[{it:05d}] | {elapsed:7.1f}s | "
                 f"{m0['loss']:7.3f}  {m1['loss']:7.3f} | "
                 f"{fmt_pair_counts(len(agent0.buffer), len(agent1.buffer)):>9} | "
                 f"{fmt_pct(single)} ({fmt_counts(single)})  |  "
