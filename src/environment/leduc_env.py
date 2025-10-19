@@ -12,17 +12,19 @@ class LeducEnv:
     """
     RANKS   = ["J", "Q", "K"]
 
-    def __init__(self):
-        self.reset()
+    def __init__(self, deck=None):
+        self.reset(deck)
     
-    def reset(self):
-        deck = ["J","J","Q","Q","K","K"]
-        random.shuffle(deck)
-        self.private = {0: deck.pop(), 1: deck.pop()}
+    def reset(self, deck=None):
+        if deck is not None:
+            self.deck = deck.copy()
+        else:
+            self.deck = ["J", "J", "Q", "Q", "K", "K"]
+            random.shuffle(self.deck)
+        self.private = {0: self.deck.pop(), 1: self.deck.pop()}
         self.stakes = {0: 1, 1: 2} # Player 0 small blind, bets 1. Player 1 big blind, bets 2
         self.raises = {0: 1, 1: 1} # Players can only raise once per betting round as in Pettingzoo
         self.public = None
-        self.deck = deck
 
         self.to_call = True
         self.stage = 0 # 0 = preflop, 1 = postflop

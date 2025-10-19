@@ -2,7 +2,7 @@ from matplotlib import pyplot as plt
 import numpy as np
 from environment.leduc_env import LeducEnv
 from algorithms.cfragent import CFRAgent
-from src.environment.leduc_env_usage import decode_observation
+from environment.leduc_env_usage import decode_observation
 
 
 def train_cfr(iterations=10000, print_every=1000):
@@ -62,7 +62,7 @@ def play_against_cfr(agent, num_games=10):
                     action = int(input("Enter action: "))
             else:  # CFR agent
                 info_set = agent.get_information_set(obs, env.stage)
-                strategy = agent.get_average_strategy(info_set, mask)
+                strategy = agent.get_average_strategy(info_set)
                 action = agent.sample_action(strategy, mask)
                 action_names = ['Call', 'Raise', 'Fold', 'Check']
                 print(f"Opponent chose: {action_names[action]}")
@@ -96,7 +96,7 @@ def play_against_cfr(agent, num_games=10):
 
 if __name__ == "__main__":
     # Train the agent
-    agent = train_cfr(iterations=10000, print_every=2000)
+    agent = train_cfr(iterations=1000, print_every=200)
    
     # Play against it
     print("\n" + "="*50)

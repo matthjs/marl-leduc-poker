@@ -1,7 +1,7 @@
 
 import numpy as np
 
-from src.environment.leduc_env import LeducEnv
+from environment.leduc_env import LeducEnv
 
 def decode_one_hot_card(array):
     mapping = ['J', 'Q', 'K']
