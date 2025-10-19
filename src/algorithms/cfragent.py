@@ -1,7 +1,6 @@
 from typing import Tuple
 import numpy as np
 from collections import defaultdict
-import random
 from environment.leduc_env import LeducEnv
 
 
@@ -22,6 +21,8 @@ class CFRAgent:
         # Current iteration
         self.iteration = 0
         self.cfrplus = cfrplus
+        # Sample efficiency
+        self.nodes_touched = 0
    
     def get_information_set(self, obs: np.ndarray, stage: int) -> Tuple[int, int, int, int, int]:
         """
@@ -81,6 +82,8 @@ class CFRAgent:
         if done:
             rewards = env.get_rewards()
             return rewards[player]
+        
+        self.nodes_touched += 1
        
         current_player = env.current
         stage = env.stage
