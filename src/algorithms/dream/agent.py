@@ -50,6 +50,9 @@ class DreamAgent:
         self.strategy_sum: Dict[bytes, np.ndarray] = {}
         # cumulative reach weight
         self.strategy_w: Dict[bytes, float] = {}
+        # nodes touched as sample efficiency metric
+        self.nodes_touched = 0
+
 
 
     # ---------- Acting ----------
@@ -123,6 +126,8 @@ class DreamAgent:
                 traj.append((obs.copy(), mask.copy(), p, a, None))  # no opp weight needed for opponent nodes
 
             _ = env.step(a)
+            # Count transitions as nodes_touched (states visited)
+            self.nodes_touched += 1
             done = env.terminal
             if not done:
                 obs = env.get_observation()
