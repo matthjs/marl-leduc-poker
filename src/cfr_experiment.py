@@ -42,21 +42,51 @@ class Experiment:
         """
         pi_0, pi_1 = self.agent.get_average_strategy_separated()
         
-        # Generate all 90 possible initial card distributions
-        deck = ["J","J","Q","Q","K","K"]
-        unique_decks = set(itertools.permutations(deck))
+        # Loop over all 24 possible initial card distributions
+        # (only first 3 cards matter, 2x private 1x public)
+        # (are last 3 cards per deck as pop is used in env)
+        unique_decks = [
+            ['Q','K','K','J','J','Q'],
+            ['Q','Q','K','J','J','K'],
+            ['Q','K','K','J','Q','J'],
+            ['Q','Q','K','J','K','J'],
+            ['J','K','K','Q','Q','J'],
+            ['J','J','K','Q','Q','K'],
+            ['J','K','K','Q','J','Q'],
+            ['J','J','K','Q','K','Q'],
+            ['J','Q','Q','K','K','J'],
+            ['J','J','Q','K','K','Q'],
+            ['J','Q','Q','K','J','K'],
+            ['J','J','Q','K','Q','K'],
+            ['J','Q','Q','J','K','K'],
+            ['J','K','K','J','Q','Q'],
+            ['J','J','J','Q','K','K'],
+            ['J','K','K','Q','J','J'],
+            ['Q','Q','K','K','J','J'],
+            ['J','J','K','K','Q','Q'],
+            ['J','Q','K','J','Q','K'],
+            ['J','K','Q','J','K','Q'],
+            ['J','Q','K','Q','J','K'],
+            ['J','K','Q','Q','K','J'],
+            ['J','Q','K','K','J','Q'],
+            ['J','K','Q','K','Q','J']
+        ]
+        unique_deck_probs = [
+            1/30, 1/30, 1/30, 1/30, 1/30, 1/30,
+            1/30, 1/30, 1/30, 1/30, 1/30, 1/30,
+            1/30, 1/30, 1/30, 1/30, 1/30, 1/30,
+            1/15, 1/15, 1/15, 1/15, 1/15, 1/15
+        ]
 
         exploitability = 0
-        for deck in unique_decks:
+        for deck, prob in zip(unique_decks, unique_deck_probs):
             # Evaluate best response for both players
-            env = LeducEnv(list(deck))
+            env = LeducEnv(deck)
             v_br0 = self.recursive_evaluate_best_respons(env, br_player=0, other_policy=pi_1)
-            env.reset(list(deck))
+            env.reset(deck)
             v_br1 = self.recursive_evaluate_best_respons(env, br_player=1, other_policy=pi_0)
-            exploitability += v_br0 + (-v_br1)
+            exploitability +=prob * (v_br0 + (-v_br1))
 
-        # Average over all initial states
-        exploitability /= len(unique_decks)
         return exploitability
         
     def recursive_evaluate_best_respons(self, env, br_player, other_policy):
@@ -109,7 +139,7 @@ def plot_exploitability(iters, nodes_touched, exploitabilities, title="Exploitab
     plt.figure(figsize=(8, 4.5))
     plt.plot(iters, exploitabilities, marker='o', linewidth=1)
     plt.xlabel("Training iterations")
-    plt.ylabel("Exploitability (player-0 units)")
+    plt.ylabel("Exploitability (reward units)")
     plt.title(title + " (vs iterations)")
     plt.grid(True)
     plt.tight_layout()
@@ -121,7 +151,7 @@ def plot_exploitability(iters, nodes_touched, exploitabilities, title="Exploitab
     plt.figure(figsize=(8, 4.5))
     plt.plot(nodes_touched, exploitabilities, marker='o', linewidth=1, color='orange')
     plt.xlabel("Nodes touched")
-    plt.ylabel("Exploitability (player-0 units)")
+    plt.ylabel("Exploitability (reward units)")
     plt.title(title + " (vs nodes touched)")
     plt.grid(True)
     plt.tight_layout()
@@ -136,6 +166,6 @@ if __name__ == "__main__":
     # Run training and evaluation
     iters, nodes_touched, exploits = exp.run()
     # Plot exploitability curves
-    plot_exploitability(iters, nodes_touched, exploits, outfile='CFR_test')
+    plot_exploitability(iters, nodes_touched, exploits, outfile='CFR2_test')
     t1 = time.perf_counter()
     print(f"Elapsed: {t1 - t0:.6f} s")
