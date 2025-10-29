@@ -5,36 +5,34 @@ import numpy as np
 import copy
 import time
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 
-class Experiment:
+class Experiment2:
     def __init__(self):
         # Initialize CFR agent
         self.agent = CFRAgent()
 
-    def run(self, iterations=3000, eval_every=50):
+    def run(self, iterations=4000, eval_every=50):
         """
         Run training iterations and evaluate exploitability periodically.
-        Returns iteration numbers, nodes touched, and exploitabilities.
+        Returns iteration numbers, and exploitabilities.
         """
         iters = []
-        nodes_touched = []
         exploits = []
 
         # Initial evaluation before training
         iters.append(0)
-        nodes_touched.append(0)
         exploits.append(self.eval_profile())
 
-        for i in range(iterations):
+        for i in tqdm(range(iterations), ascii=True, desc="CFR_P"):
             # Perform one training iteration
             self.agent.train_iteration()
        
             if (i + 1) % eval_every == 0:
                 # Record progress every eval_every iterations
                 iters.append(i+1)
-                nodes_touched.append(self.agent.nodes_touched)
                 exploits.append(self.eval_profile())
-        return iters, nodes_touched, exploits
+        return iters, exploits
 
     def eval_profile(self):
         """
@@ -85,7 +83,11 @@ class Experiment:
             v_br0 = self.recursive_evaluate_best_respons(env, br_player=0, other_policy=pi_1)
             env.reset(deck)
             v_br1 = self.recursive_evaluate_best_respons(env, br_player=1, other_policy=pi_0)
-            exploitability +=prob * (v_br0 + (-v_br1))
+            # Evaluate policy values
+            env.reset(deck)
+            v_pi0, v_pi1 = self.recursive_evaluate_policy_value(env, pi_0=pi_0, pi_1=pi_1)
+
+            exploitability += prob * ((v_br0 - v_pi0) + (v_br1 - v_pi1))
 
         return exploitability
         
@@ -95,30 +97,21 @@ class Experiment:
         """
         obs, mask, done = env.last()
         if done:
-            # Return terminal reward for player 0
-            return env.get_rewards()[0]
+            # Return terminal reward for best response player
+            return env.get_rewards()[br_player]
         
         info_set = self.agent.get_information_set(obs, env.stage)
         current = env.current
 
         if current == br_player:
-            # Maximize for player 0, minimize for player 1
-            if br_player == 0:
-                best = -np.inf
-                for a in env.legal_actions():
-                    env_copy = self.agent.copy_env(env)
-                    env_copy.step(a)
-                    val = self.recursive_evaluate_best_respons(env_copy, br_player, other_policy)
-                    best = max(best, val)
-                return best
-            else:
-                worst = np.inf
-                for a in env.legal_actions():
-                    env_copy = copy.deepcopy(env)
-                    env_copy.step(a)
-                    val = self.recursive_evaluate_best_respons(env_copy, br_player, other_policy)
-                    worst = min(worst, val)
-                return worst
+            # Maximize br_player reward
+            best = -np.inf
+            for a in env.legal_actions():
+                env_copy = copy.deepcopy(env)
+                env_copy.step(a)
+                val = self.recursive_evaluate_best_respons(env_copy, br_player, other_policy)
+                best = max(best, val)
+            return best
         else:
             # Follow the other player's policy
             if info_set in other_policy:
@@ -134,7 +127,42 @@ class Experiment:
                 ev += prob * self.recursive_evaluate_best_respons(env_copy, br_player, other_policy)
             return ev
 
-def plot_exploitability(iters, nodes_touched, exploitabilities, title="Exploitability over training (CFR)", outfile=None):
+    def recursive_evaluate_policy_value(self, env, pi_0, pi_1):
+        """
+        Recursively compute policy values for both player.
+        """
+        obs, mask, done = env.last()
+        # Return terminal rewards
+        if done:
+            return env.get_rewards()[0], env.get_rewards()[1]
+
+        current = env.current
+        info_set = self.agent.get_information_set(obs, env.stage)
+
+        if current == 0:
+            if info_set in pi_0:
+                action_probs = pi_0[info_set]
+            else:
+                # Default to uniform if info_set not in policy
+                action_probs = mask * (1 / np.sum(mask))
+        else:
+            if info_set in pi_1:
+                action_probs = pi_1[info_set]
+            else:
+                # Default to uniform if info_set not in policy
+                action_probs = mask * (1 / np.sum(mask))
+
+        ev0, ev1 = 0, 0
+        for a in env.legal_actions():
+            prob = action_probs[a]
+            env_copy = copy.deepcopy(env)
+            env_copy.step(a)
+            v0, v1 = self.recursive_evaluate_policy_value(env_copy, pi_0, pi_1)
+            ev0 += prob * v0
+            ev1 += prob * v1
+        return ev0, ev1
+
+def plot_exploitability(iters, exploitabilities, title="Exploitability over training (CFR)", outfile=None):
     # Plot exploitability vs iterations
     plt.figure(figsize=(8, 4.5))
     plt.plot(iters, exploitabilities, marker='o', linewidth=1)
@@ -147,25 +175,13 @@ def plot_exploitability(iters, nodes_touched, exploitabilities, title="Exploitab
         plt.savefig(outfile + "_iterations.png", dpi=200)
     plt.show()
 
-    # Plot exploitability vs nodes touched
-    plt.figure(figsize=(8, 4.5))
-    plt.plot(nodes_touched, exploitabilities, marker='o', linewidth=1, color='orange')
-    plt.xlabel("Nodes touched")
-    plt.ylabel("Exploitability (reward units)")
-    plt.title(title + " (vs nodes touched)")
-    plt.grid(True)
-    plt.tight_layout()
-    if outfile is not None:
-        plt.savefig(outfile + "_nodes.png", dpi=200)
-    plt.show()
-
 
 if __name__ == "__main__":
     t0 = time.perf_counter()
-    exp = Experiment()
+    exp = Experiment2()
     # Run training and evaluation
-    iters, nodes_touched, exploits = exp.run()
+    iters, exploits = exp.run()
     # Plot exploitability curves
-    plot_exploitability(iters, nodes_touched, exploits, outfile='CFR2_test')
+    plot_exploitability(iters, exploits, outfile='CFR2POOPOO_test')
     t1 = time.perf_counter()
     print(f"Elapsed: {t1 - t0:.6f} s")

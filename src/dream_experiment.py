@@ -6,6 +6,7 @@ import torch
 import copy
 import time
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 class Experiment:
     def __init__(self):
@@ -23,25 +24,23 @@ class Experiment:
         self.agent1.baseline.load_state_dict(self.agent0.baseline.state_dict())
 
 
-    def run(self, seed=42, iters=5000, eval_every=50, trajs_per_iter=64, batch_size=4096):
+    def run(self, seed=42, iters=4000, eval_every=50, trajs_per_iter=64, batch_size=4096):
         """
         Run training iterations and evaluate exploitability periodically.
-        Returns iteration numbers, nodes touched, and exploitabilities.
+        Returns iteration numbers, and exploitabilities.
         """
         # Reused rollout envs (one per seat)
         roll_env0 = LeducEnv()
         roll_env1 = LeducEnv()
 
         iterations = []
-        nodes_touched = []
         exploits = []
 
         # Initial evaluation before training
         iterations.append(0)
-        nodes_touched.append(0)
         exploits.append(self.eval_profile())
 
-        for it in range(1, iters+1):
+        for it in tqdm(range(1, iters+1), ascii=True, desc="DREAM"):
             # Perform one training iteration
             # Decay exploration
             self.agent0.eps = max(0.02, 0.10 * (1.0 - it / 2000.0))
@@ -59,8 +58,7 @@ class Experiment:
                 # Record progress every eval_every iterations
                 iterations.append(it)
                 exploits.append(self.eval_profile())
-                nodes_touched.append(self.agent0.nodes_touched + self.agent1.nodes_touched)
-        return iterations, nodes_touched, exploits
+        return iterations, exploits
         
 
     def eval_profile(self):
@@ -111,7 +109,11 @@ class Experiment:
             v_br0 = self.recursive_evaluate_best_respons(env, br_player=0, other_player=self.agent1)
             env.reset(deck)
             v_br1 = self.recursive_evaluate_best_respons(env, br_player=1, other_player=self.agent0)
-            exploitability += prob * (v_br0 + (-v_br1))
+            # Evaluate policy values
+            env.reset(deck)
+            v_pi0, v_pi1 = self.recursive_evaluate_policy_value(env, self.agent0, self.agent1)
+
+            exploitability += prob * ((v_br0 - v_pi0) + (v_br1 - v_pi1))
 
         return exploitability
         
@@ -121,29 +123,20 @@ class Experiment:
         """
         obs, mask, done = env.last()
         if done:
-            # Return terminal reward for player 0
-            return env.get_rewards()[0]
+            # Return terminal reward for best response player
+            return env.get_rewards()[br_player]
         
         current = env.current
 
         if current == br_player:
-            # Maximize for player 0, minimize for player 1
-            if br_player == 0:
-                best = -np.inf
-                for a in env.legal_actions():
-                    env_copy = copy.deepcopy(env)
-                    env_copy.step(a)
-                    val = self.recursive_evaluate_best_respons(env_copy, br_player, other_player)
-                    best = max(best, val)
-                return best
-            else:
-                worst = np.inf
-                for a in env.legal_actions():
-                    env_copy = copy.deepcopy(env)
-                    env_copy.step(a)
-                    val = self.recursive_evaluate_best_respons(env_copy, br_player, other_player)
-                    worst = min(worst, val)
-                return worst
+            # Maximize br_player reward
+            best = -np.inf
+            for a in env.legal_actions():
+                env_copy = copy.deepcopy(env)
+                env_copy.step(a)
+                val = self.recursive_evaluate_best_respons(env_copy, br_player, other_player)
+                best = max(best, val)
+            return best
         else:
             # Follow the other player's policy
             action_probs = other_player.policy(obs, mask)
@@ -154,8 +147,33 @@ class Experiment:
                 env_copy.step(a)
                 ev += prob * self.recursive_evaluate_best_respons(env_copy, br_player, other_player)
             return ev
+        
+    def recursive_evaluate_policy_value(self, env, agent0, agent1):
+        """
+        Recursively compute expected value of the current policy for both players.
+        """
+        obs, mask, done = env.last()
+        if done:
+            return env.get_rewards()[0], env.get_rewards()[1]
 
-def plot_exploitability(iters, nodes_touched, exploitabilities, title="Exploitability over training (DREAM)", outfile=None):
+        current = env.current
+        if current == 0:
+            action_probs = agent0.policy(obs, mask)
+        else:
+            action_probs = agent1.policy(obs, mask)
+
+        ev0, ev1 = 0, 0
+        for a in env.legal_actions():
+            prob = action_probs[a]
+            env_copy = copy.deepcopy(env)
+            env_copy.step(a)
+            v0, v1 = self.recursive_evaluate_policy_value(env_copy, agent0, agent1)
+            ev0 += prob * v0
+            ev1 += prob * v1
+        return ev0, ev1
+
+
+def plot_exploitability(iters, exploitabilities, title="Exploitability over training (DREAM)", outfile=None):
     # Plot exploitability vs iterations
     plt.figure(figsize=(8, 4.5))
     plt.plot(iters, exploitabilities, marker='o', linewidth=1)
@@ -168,23 +186,11 @@ def plot_exploitability(iters, nodes_touched, exploitabilities, title="Exploitab
         plt.savefig(outfile + "_iterations.png", dpi=200)
     plt.show()
 
-    # Plot exploitability vs nodes touched
-    plt.figure(figsize=(8, 4.5))
-    plt.plot(nodes_touched, exploitabilities, marker='o', linewidth=1, color='orange')
-    plt.xlabel("Nodes touched")
-    plt.ylabel("Exploitability (reward units)")
-    plt.title(title + " (vs nodes touched)")
-    plt.grid(True)
-    plt.tight_layout()
-    if outfile is not None:
-        plt.savefig(outfile + "_nodes.png", dpi=200)
-    plt.show()
-
 if __name__ == "__main__":
     t0 = time.perf_counter()
     exp = Experiment()
-    iters, nodes_touched, exploits = exp.run()
+    iters, exploits = exp.run()
     # Plot exploitability curves
-    plot_exploitability(iters, nodes_touched, exploits, outfile='DREAM_test')
+    plot_exploitability(iters, exploits, outfile='DREAM_test')
     t1 = time.perf_counter()
     print(f"Elapsed: {t1 - t0:.6f} s")
