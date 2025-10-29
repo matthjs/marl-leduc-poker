@@ -1,26 +1,28 @@
 from typing import Tuple
 import numpy as np
 from collections import defaultdict
-import random
-from src.environment.leduc_env import LeducEnv
-from src.environment.leduc_env_usage import decode_observation
+from environment.leduc_env import LeducEnv
 
 
-class CFRPlusAgent:
+class CFRAgent:
     """
     Counterfactual Regret Minimization Plus implementation for Leduc Poker.
     Uses Regret Matching+ at each information set.
     """
    
-    def __init__(self):
+    def __init__(self, cfrplus: bool = True):
         # Cumulative regrets for each information set and action
         self.regret_sum = defaultdict(lambda: np.zeros(4))
-       
-        # Strategy sum for computing average strategy
-        self.strategy_sum = defaultdict(lambda: np.zeros(4))
-       
+        # Strategy sum for players for computing seperable average strategy for testing
+        self.strategy_sum_0 = defaultdict(lambda: np.zeros(4))
+        self.strategy_sum_1 = defaultdict(lambda: np.zeros(4))
+        self.strategy_masks_0 = defaultdict(lambda: np.zeros(4))
+        self.strategy_masks_1 = defaultdict(lambda: np.zeros(4))
         # Current iteration
         self.iteration = 0
+        self.cfrplus = cfrplus
+        # Sample efficiency
+        self.nodes_touched = 0
    
     def get_information_set(self, obs: np.ndarray, stage: int) -> Tuple[int, int, int, int, int]:
         """
@@ -34,7 +36,7 @@ class CFRPlusAgent:
        
         return (private_card, public_card, own_stake, other_stake, stage)
    
-    def get_strategy(self, info_set: Tuple[int, int, int, int, int], mask: np.ndarray) -> np.ndarray:
+    def policy(self, info_set: Tuple[int, int, int, int, int], mask: np.ndarray) -> np.ndarray:
         """
         Get current strategy using Regret Matching+.
         Only considers legal actions (mask == 1).
@@ -60,10 +62,10 @@ class CFRPlusAgent:
     def get_action(self, obs: np.ndarray, mask: np.ndarray, stage: int) -> int:
         """Sample an action according to current strategy."""
         info_set = self.get_information_set(obs, stage)
-        strategy = self.get_strategy(info_set, mask)
+        policy = self.policy(info_set, mask)   # get strategy
        
         legal_actions = np.where(mask == 1)[0]
-        action_probs = strategy[legal_actions]
+        action_probs = policy[legal_actions]
         action_probs = action_probs / action_probs.sum()  # Normalize
        
         return np.random.choice(legal_actions, p=action_probs)
@@ -80,11 +82,13 @@ class CFRPlusAgent:
         if done:
             rewards = env.get_rewards()
             return rewards[player]
+        
+        self.nodes_touched += 1
        
         current_player = env.current
         stage = env.stage
         info_set = self.get_information_set(obs, stage)
-        strategy = self.get_strategy(info_set, mask)
+        strategy = self.policy(info_set, mask)
        
         # If it's our turn, we need to compute counterfactual values
         if current_player == player:
@@ -121,7 +125,14 @@ class CFRPlusAgent:
            
             # Update strategy sum for average strategy (weighted by our reach prob)
             our_reach = reach_prob_0 if player == 0 else reach_prob_1
-            self.strategy_sum[info_set] += our_reach * strategy
+            if player == 0:
+                self.strategy_sum_0[info_set] += our_reach * strategy
+                if info_set not in self.strategy_masks_0:
+                    self.strategy_masks_0[info_set] = mask 
+            else:
+                self.strategy_sum_1[info_set] += our_reach * strategy
+                if info_set not in self.strategy_masks_1:
+                    self.strategy_masks_1[info_set] = mask 
            
             return node_utility
        
@@ -177,24 +188,30 @@ class CFRPlusAgent:
         self.iteration += 1
        
         # CFR+ specific: floor regrets at 0
-        for info_set in self.regret_sum:
-            self.regret_sum[info_set] = np.maximum(self.regret_sum[info_set], 0)
-   
-    def get_average_strategy(self, info_set: Tuple[int, int, int, int, int], mask: np.ndarray) -> np.ndarray:
-        """Get the average strategy over all iterations."""
-        strategy_sum = self.strategy_sum[info_set].copy()
-       
-        # Apply mask
-        strategy_sum = strategy_sum * mask
-       
-        sum_strategy = np.sum(strategy_sum[mask == 1])
-       
-        if sum_strategy > 0:
-            avg_strategy = strategy_sum / sum_strategy
-        else:
-            # Uniform over legal actions
-            avg_strategy = mask / np.sum(mask)
-       
-        return avg_strategy
+        if self.cfrplus:
+            for info_set in self.regret_sum:
+                self.regret_sum[info_set] = np.maximum(self.regret_sum[info_set], 0)
 
+    def get_average_strategy_separated(self):
+        """
+        Return two dictionaries: one for player 0, one for player 1.
+        Each dictionary maps info_set -> average strategy vector.
+        """
 
+        def compute_average_strategy(strategy_sum, masks):
+            avg_strategy = {}
+
+            for info_set, strategy_sum in strategy_sum.items():
+                mask = masks.get(info_set)
+                strategy_sum_masked = strategy_sum * mask
+                total = np.sum(strategy_sum_masked)
+                if total > 0:
+                    avg_strategy[info_set] = strategy_sum_masked / total
+                else:
+                    avg_strategy[info_set] = mask * (1 / np.sum(mask)) #Uniform over legal
+            return avg_strategy
+        
+        avg_strategy_0 = compute_average_strategy(self.strategy_sum_0, self.strategy_masks_0)
+        avg_strategy_1 = compute_average_strategy(self.strategy_sum_1, self.strategy_masks_1)
+        
+        return avg_strategy_0, avg_strategy_1
