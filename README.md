@@ -1,12 +1,11 @@
 <br />
 <p align="center">
-  <h1 align="center">Insert Project Name</h1>
+  <h1 align="center">Solving Leduc Poker with Counterfactual Regret
+Minimization</h1>
 
   <p align="center">
   </p>
 </p>
-
-## About The Project
 
 ## Installation Instructions
 
@@ -45,25 +44,4 @@ source .venv/bin/activate
 python <script_name>
 ```
 
-## Training
-
-### Configuration
-
-The training script uses Hydra for configuration management with organized configuration files:
-
-[...]
-
-### Environment Setup
-
-Create a `.env` file in the project root to store environment variables. You can start by copying the example file:
-
-```bash
-cp .env.example .env
-```
-
-Then edit the `.env` file with your actual values:
-```bash
-# Example .env file
-WANDB_API_KEY=your_wandb_api_key_here
-# Add other environment variables as needed
-```
+See the `main.py` script for running experiments/reproducing results.
