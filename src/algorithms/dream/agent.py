@@ -258,7 +258,9 @@ class DreamAgent:
                     iter_t=self.iter_count,
                 ))
                 w_IS = 1.0 if strict_on_policy else (reach_target / max(reach_sampling, 1e-12))
-                # Save info to build DREAM advantages later (includes w_I for this infoset)
+                if not strict_on_policy:
+                    pa = float(pi_here[a])                     # mu(a|I)
+                    w_IS *= 1.0 / max(pa, 1e-12)               # multiply by 1/mu(a|I)
                 decisions.append((obs_here, mask_here, a, pi_here, float(w_IS)))
 
             else:
