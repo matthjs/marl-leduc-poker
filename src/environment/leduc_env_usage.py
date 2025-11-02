@@ -1,4 +1,4 @@
-from leduc_env import LeducEnv
+from environment.leduc_env import LeducEnv
 import numpy as np
 
 def decode_one_hot_card(array):

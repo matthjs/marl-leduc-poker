@@ -7,22 +7,27 @@ import time
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
+import os, csv
+from datetime import datetime
+
 class Experiment2:
     def __init__(self):
         # Initialize CFR agent
         self.agent = CFRAgent()
 
-    def run(self, iterations=4000, eval_every=50):
+    def run(self, iterations=1000, eval_every=50):
         """
         Run training iterations and evaluate exploitability periodically.
-        Returns iteration numbers, and exploitabilities.
+        Returns iteration numbers, exploitabilities, and wallclock times (per eval).
         """
         iters = []
         exploits = []
+        eval_times = [] 
 
         # Initial evaluation before training
         iters.append(0)
         exploits.append(self.eval_profile())
+        eval_times.append(time.time())  
 
         for i in tqdm(range(iterations), ascii=True, desc="CFR_P"):
             # Perform one training iteration
@@ -32,7 +37,8 @@ class Experiment2:
                 # Record progress every eval_every iterations
                 iters.append(i+1)
                 exploits.append(self.eval_profile())
-        return iters, exploits
+                eval_times.append(time.time())  
+        return iters, exploits, eval_times  
 
     def eval_profile(self):
         """
@@ -40,9 +46,6 @@ class Experiment2:
         """
         pi_0, pi_1 = self.agent.get_average_strategy_separated()
         
-        # Loop over all 24 possible initial card distributions
-        # (only first 3 cards matter, 2x private 1x public)
-        # (are last 3 cards per deck as pop is used in env)
         unique_decks = [
             ['Q','K','K','J','J','Q'],
             ['Q','Q','K','J','J','K'],
@@ -78,12 +81,10 @@ class Experiment2:
 
         exploitability = 0
         for deck, prob in zip(unique_decks, unique_deck_probs):
-            # Evaluate best response for both players
             env = LeducEnv(deck)
             v_br0 = self.recursive_evaluate_best_respons(env, br_player=0, other_policy=pi_1)
             env.reset(deck)
             v_br1 = self.recursive_evaluate_best_respons(env, br_player=1, other_policy=pi_0)
-            # Evaluate policy values
             env.reset(deck)
             v_pi0, v_pi1 = self.recursive_evaluate_policy_value(env, pi_0=pi_0, pi_1=pi_1)
 
@@ -97,14 +98,12 @@ class Experiment2:
         """
         obs, mask, done = env.last()
         if done:
-            # Return terminal reward for best response player
             return env.get_rewards()[br_player]
         
         info_set = self.agent.get_information_set(obs, env.stage)
         current = env.current
 
         if current == br_player:
-            # Maximize br_player reward
             best = -np.inf
             for a in env.legal_actions():
                 env_copy = copy.deepcopy(env)
@@ -113,11 +112,9 @@ class Experiment2:
                 best = max(best, val)
             return best
         else:
-            # Follow the other player's policy
             if info_set in other_policy:
                 action_probs = other_policy.get(info_set)
             else:
-                # Default to uniform if info_set not in policy
                 action_probs = mask * (1 / np.sum(mask))
             ev = 0
             for a in env.legal_actions():
@@ -129,10 +126,9 @@ class Experiment2:
 
     def recursive_evaluate_policy_value(self, env, pi_0, pi_1):
         """
-        Recursively compute policy values for both player.
+        Recursively compute policy values for both players.
         """
         obs, mask, done = env.last()
-        # Return terminal rewards
         if done:
             return env.get_rewards()[0], env.get_rewards()[1]
 
@@ -140,17 +136,9 @@ class Experiment2:
         info_set = self.agent.get_information_set(obs, env.stage)
 
         if current == 0:
-            if info_set in pi_0:
-                action_probs = pi_0[info_set]
-            else:
-                # Default to uniform if info_set not in policy
-                action_probs = mask * (1 / np.sum(mask))
+            action_probs = pi_0.get(info_set, mask * (1 / np.sum(mask)))
         else:
-            if info_set in pi_1:
-                action_probs = pi_1[info_set]
-            else:
-                # Default to uniform if info_set not in policy
-                action_probs = mask * (1 / np.sum(mask))
+            action_probs = pi_1.get(info_set, mask * (1 / np.sum(mask)))
 
         ev0, ev1 = 0, 0
         for a in env.legal_actions():
@@ -162,8 +150,20 @@ class Experiment2:
             ev1 += prob * v1
         return ev0, ev1
 
+    def save_csv(self, iters, exploits, eval_times, outdir="results", prefix="CFR"):
+        os.makedirs(outdir, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(outdir, f"{prefix}_{stamp}.csv")
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["eval_wallclock", "iteration", "exploitability"])
+            for ts, it, ex in zip(eval_times, iters, exploits):
+                wall = datetime.fromtimestamp(ts).isoformat(timespec="seconds")
+                w.writerow([wall, it, f"{ex:.6f}"])
+        print(f"[CSV] Saved evaluations to {path}")
+        return path
+
 def plot_exploitability(iters, exploitabilities, title="Exploitability over training (CFR)", outfile=None):
-    # Plot exploitability vs iterations
     plt.figure(figsize=(8, 4.5))
     plt.plot(iters, exploitabilities, marker='o', linewidth=1)
     plt.xlabel("Training iterations")
@@ -180,7 +180,9 @@ if __name__ == "__main__":
     t0 = time.perf_counter()
     exp = Experiment2()
     # Run training and evaluation
-    iters, exploits = exp.run()
+    iters, exploits, eval_times = exp.run()  
+    # Save CSV (timestamped filename)
+    exp.save_csv(iters, exploits, eval_times, outdir="results", prefix="CFR_P")  
     # Plot exploitability curves
     plot_exploitability(iters, exploits, outfile='CFR2POOPOO_test')
     t1 = time.perf_counter()

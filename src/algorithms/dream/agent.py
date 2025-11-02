@@ -8,9 +8,9 @@ from copy import deepcopy
 
 from .networks import RegretNet, QNet, AverageNet
 from .buffers import (
-    RegretBuffer, RegretSample,   # NOTE: RegretSample must have fields: obs, mask, adv, iter_t
+    RegretBuffer, RegretSample, 
     QBuffer, QTransition,
-    PolicyBuffer, PolicySample
+    PolicyBuffer, PolicySample,
 )
 
 class DreamAgent:
@@ -44,6 +44,7 @@ class DreamAgent:
         # Q targets & regularization (kept from your code)
         self.q_target_clip = None
         self.q_output_l2 = 3e-4
+
 
         # --- Networks ---
         self.regret_net = RegretNet(obs_dim, act_dim, hidden=hidden, layers=layers).to(self.device)
@@ -112,16 +113,37 @@ class DreamAgent:
                             strict_on_policy: bool = True) -> float:
         """
         Outcome-sampling rollout that:
-        (1) builds DREAM per-iteration advantages (Problem A),
-        (2) stores TD transitions for the Q baseline (Problem C),
-        (3) fixes reach / importance weights (Problem D).
-
-        If strict_on_policy=True (default), opponents & chance are sampled from their
-        target distributions → IS ratio = 1, so no variance blow-up and no brittle constants.
-        If you pass strict_on_policy=False, we compute w(I) = target_reach / sampling_reach
-        over opponent & chance to the traverser infoset I and weight Â by w(I).
+        (1) builds DREAM per-iteration advantages,
+        (2) stores TD transitions for the Q baseline ,
+        (3) fixes reach / importance weights .
         """
         # ---------- tiny helpers ----------
+
+        def _norm_over_legal(p, m):
+            p = p * (m > 0).astype(np.float32)
+            s = float(p.sum())
+            if s <= 1e-12:
+                out = np.zeros_like(p, dtype=np.float32)
+                legal = np.where(m > 0)[0]
+                if len(legal) > 0: out[legal] = 1.0 / len(legal)
+                return out
+            return (p / s).astype(np.float32)
+        
+        def opp_reference_policy(o, m):
+            if opponent is not None:
+                p = opponent.policy(o, m, use_average=getattr(opponent, "use_avg_net", False))
+            else:
+                p = self.policy(o, m, use_average=getattr(self, "use_avg_net", False))
+            return _norm_over_legal(p, m)
+
+        def opp_target_policy(o, m):
+            return opp_reference_policy(o, m)
+
+
+        def opp_behavior_policy(o, m):
+            # Lowest variance: behavior = target (so IS ratio for others stays 1)
+            return opp_target_policy(o, m)
+
         def rm_policy(o, m):
             pi = self._regret_matching(o, m)
             legal = (m > 0)
@@ -132,20 +154,6 @@ class DreamAgent:
                 pi[~legal] = 0.0
                 pi /= s
             return pi
-
-        def opp_target_policy(o, m):
-            # "target" opponent policy (what CFR evaluates against).
-            if opponent is not None:
-                return opponent.policy(o, m, use_average=getattr(opponent, "use_avg_net", False))
-            return self.policy(o, m, use_average=getattr(self, "use_avg_net", False))
-
-        def opp_behavior_policy(o, m):
-            # If strict_on_policy, behavior == target (keeps IS=1). Otherwise, you
-            # may define a different behavior policy here (e.g., ε-greedy).
-            if strict_on_policy:
-                return opp_target_policy(o, m)
-            # Example off-policy behavior: same as target by default; customize if needed.
-            return opp_target_policy(o, m)
 
         def chance_prob(prev_obs, action, next_obs):
             """
@@ -212,16 +220,9 @@ class DreamAgent:
                 # Roll forward opponents/chance to next traverser decision or terminal
                 while not done and env.current != player_i:
                     if is_chance_turn():
-                        # CHANCE: sample from its (behavior) distribution; update reach
-                        # We don't know the distribution explicitly, so we assume the env
-                        # samples an outcome. If env exposes prob for the sampled outcome,
-                        # chance_prob(prev_state, action, next_state) should return it.
-                        # We need the realized action to get its prob; many envs don't expose
-                        # "chance action id". If not available, we assume matched target/behavior.
                         p_t, p_b = chance_prob(prev_obs, None, obs)  # action unknown → best effort
                         reach_sampling *= float(p_b)
                         reach_target   *= float(p_t)
-                        # advance already happened above when env sampled chance into `obs`
                         pass
                     else:
                         # OPPONENT: compute behavior and target policy over legal actions
@@ -262,7 +263,6 @@ class DreamAgent:
                     iter_t=self.iter_count,
                 ))
 
-
                 decisions.append((obs_here, mask_here, a, pi_here, mu_here, float(w_IS)))
 
             else:
@@ -271,8 +271,10 @@ class DreamAgent:
                 pi_tgt = opp_target_policy(obs, mask)
                 legal = np.where(mask > 0)[0]
                 a_opp = int(np.random.choice(legal, p=pi_beh[legal]))
+
                 reach_sampling *= float(pi_beh[a_opp])
                 reach_target   *= float(pi_tgt[a_opp])
+
                 prev_obs = obs.copy()
                 env.step(a_opp)
                 obs, mask, done = env.last()
@@ -356,33 +358,78 @@ class DreamAgent:
             for p, t in zip(self.q_net.parameters(), self.q_target_net.parameters()):
                 t.data.mul_(1 - self.q_target_tau).add_(self.q_target_tau * p.data)
 
-        # ---------------- Advantage/Regret network (A-fix) ----------------
+        # ---------------- Advantage/Regret network (with optional Extra-Gradient) ----------------
         if len(self.buffer) > 0:
-            batch = self.buffer.sample(batch_size)
-            obs  = torch.from_numpy(np.stack([b.obs  for b in batch]).astype(np.float32)).to(self.device)         # [B, obs_dim]
-            mask = torch.from_numpy(np.stack([b.mask for b in batch]).astype(np.float32)).to(self.device)         # [B, A]
-            targ = torch.from_numpy(np.stack([b.adv  for b in batch]).astype(np.float32)).to(self.device)         # [B, A]
-            iters = torch.tensor([b.iter_t for b in batch], dtype=torch.float32, device=self.device)              # [B]
+            # --- a helper to build the loss exactly like you already do ---
+            def regret_batch_and_loss():
+                batch = self.buffer.sample(batch_size)
+                obs  = torch.from_numpy(np.stack([b.obs  for b in batch]).astype(np.float32)).to(self.device)
+                mask = torch.from_numpy(np.stack([b.mask for b in batch]).astype(np.float32)).to(self.device)
+                targ = torch.from_numpy(np.stack([b.adv  for b in batch]).astype(np.float32)).to(self.device)
+                iters = torch.tensor([b.iter_t for b in batch], dtype=torch.float32, device=self.device)
 
-            pred = self.regret_net(obs)                                                                           # [B, A]
+                pred = self.regret_net(obs)     # [B, A]
+                pred = pred * mask
+                targ = targ * mask
 
-            # mask illegal actions
-            pred = pred * mask
-            targ = targ * mask
+                w = (iters / (iters.mean().clamp_min(1.0))).view(-1,1)
+                loss = ((pred - targ) ** 2)
+                loss = (loss * w).sum(dim=1).mean()
+                return loss, obs.shape[0]
 
-            # Linear-CFR iteration weights (normalize for stability)
-            w = iters / (iters.mean().clamp_min(1.0))
-            w = w.view(-1, 1)                                                                                    # [B,1]
+            if not getattr(self, "use_extragrad", False):
+                # ======= ORIGINAL SINGLE-STEP =======
+                loss, _ = regret_batch_and_loss()
+                self.regret_opt.zero_grad(set_to_none=True)
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.regret_net.parameters(), self.max_grad_norm)
+                self.regret_opt.step()
+                metrics["regret_loss"] = float(loss.item())
 
-            loss = ((pred - targ) ** 2)
-            loss = (loss * w).sum(dim=1).mean()
+            else:
+                # ======= EXTRA-GRADIENT PREDICTOR–CORRECTOR =======
+                # ---- predictor gradient at theta_t ----
+                loss1, _ = regret_batch_and_loss()
+                self.regret_opt.zero_grad(set_to_none=True)
+                loss1.backward()
 
-            self.regret_opt.zero_grad(set_to_none=True)
-            loss.backward()
-            nn.utils.clip_grad_norm_(self.regret_net.parameters(), self.max_grad_norm)
-            self.regret_opt.step()
+                # clone a temporary model and take a manual "predictor" step: theta_t -> tilde_theta
+                theta_tilde = deepcopy(self.regret_net).to(self.device).train()
+                with torch.no_grad():
+                    for p_tilde, p in zip(theta_tilde.parameters(), self.regret_net.parameters()):
+                        if p.grad is not None:
+                            p_tilde.add_( - float(self.extragrad_alpha) * p.grad )
 
-            metrics["regret_loss"] = float(loss.item())
+                # ---- corrector gradient at tilde_theta ----
+                # optionally resample to B2 (recommended); if not, reuse same batch logic
+                def regret_loss_on(model):
+                    batch = self.buffer.sample(batch_size) if self.extragrad_resample else self.buffer.sample(batch_size)
+                    obs  = torch.from_numpy(np.stack([b.obs  for b in batch]).astype(np.float32)).to(self.device)
+                    mask = torch.from_numpy(np.stack([b.mask for b in batch]).astype(np.float32)).to(self.device)
+                    targ = torch.from_numpy(np.stack([b.adv  for b in batch]).astype(np.float32)).to(self.device)
+                    iters = torch.tensor([b.iter_t for b in batch], dtype=torch.float32, device=self.device)
+                    pred = model(obs) * mask
+                    targ = targ * mask
+                    w = (iters / (iters.mean().clamp_min(1.0))).view(-1,1)
+                    loss = ((pred - targ) ** 2)
+                    return (loss * w).sum(dim=1).mean()
+
+                # backprop on the temporary model to get ∇L(tilde_theta)
+                loss2 = regret_loss_on(theta_tilde)
+                # IMPORTANT: zero original grads; compute grads w.r.t. the temp model
+                self.regret_opt.zero_grad(set_to_none=True)
+                for p in theta_tilde.parameters():
+                    if p.grad is not None: p.grad = None
+                loss2.backward()
+
+                # copy grads from temp model to the real model
+                for p, q in zip(self.regret_net.parameters(), theta_tilde.parameters()):
+                    p.grad = None if q.grad is None else q.grad.detach().clone()
+
+                # now step the real optimizer with gradient evaluated at tilde_theta
+                nn.utils.clip_grad_norm_(self.regret_net.parameters(), self.max_grad_norm)
+                self.regret_opt.step()
+                metrics["regret_loss"] = float(loss2.item())
 
         # ---------------- Average policy net (optional DREAM variant) ----------------
         if getattr(self, "use_avg_net", False) and hasattr(self, "policy_buffer") and len(self.policy_buffer) > 0:

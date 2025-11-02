@@ -1,0 +1,17 @@
+{
+  "output_root": "results",
+  "benchmark_name": "benchmark",        
+  "runs": 5,
+  "seeds": [101, 202, 303, 404, 505], 
+  "iterations": 1000,
+  "eval_every": 50,
+
+  "enable_dream": true,
+  "enable_cfr": true,
+
+  "dream": {
+    "trajs_per_iter": 256,
+    "batch_size": 8192,
+    "num_train_steps": 3
+  }
+}
