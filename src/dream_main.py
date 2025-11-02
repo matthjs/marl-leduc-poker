@@ -6,6 +6,8 @@ from contextlib import contextmanager
 from algorithms.dream import DreamAgent, set_seed
 from environment.leduc_env import LeducEnv
 from copy import deepcopy
+from algorithms.dream.sdcfr import SDCFROpponent, evaluate_sdcfr, evaluate_sdcfr_both_seats
+from algorithms.dream.networks import RegretNet
 
 
 # ---------- Opponent wrapper ----------
@@ -28,6 +30,8 @@ class AvgPolicyOpponent:
             return 0
         pi = self.policy(obs, mask, use_average=True)
         return int(np.random.choice(legal, p=pi[legal]))
+    
+
 
 
 # ---------- Formatting helpers ----------
@@ -144,6 +148,7 @@ def evaluate_vs_fixed_both_seats(env_cls, agent, opponent_policy, episodes=600):
            evaluate_vs_fixed(env_cls, agent, opponent_policy, half, agent_seat=1)
 
 
+
 # ---------- Training ----------
 def main(
     seed=42,
@@ -171,8 +176,16 @@ def main(
         lr=5e-4, lr_q=1e-4, device=device,
     )
 
-    agent0.use_avg_net = True
-    agent1.use_avg_net = True
+    def regret_net_ctor():
+        return RegretNet(obs_dim, act_dim, hidden=256, layers=2)
+
+    # SD-CFR snapshot stores (for evaluation only)
+    sdcfr_opp0 = SDCFROpponent(net_ctor=regret_net_ctor, device=device)
+    sdcfr_opp1 = SDCFROpponent(net_ctor=regret_net_ctor, device=device)
+    snapshot_every = 50  # Linear-CFR: frequent but cheap snapshots
+
+    agent0.use_avg_net = False
+    agent1.use_avg_net = False
 
     # Sync initialization
     agent1.regret_net.load_state_dict(agent0.regret_net.state_dict())
@@ -215,19 +228,37 @@ def main(
         agent0.increment_iteration()
         agent1.increment_iteration()
 
+        # ---- SD-CFR: store regret-net snapshots with Linear-CFR weights w_t = t ----
+        if it % snapshot_every == 0:
+            # weights w_t = iter_t (Linear-CFR)
+            sdcfr_opp0.add_snapshot(iter_t=agent1.iter_count,
+                                    state_dict=agent1.regret_net.state_dict())
+            sdcfr_opp1.add_snapshot(iter_t=agent0.iter_count,
+                                    state_dict=agent0.regret_net.state_dict())
+
         # Evaluation
         if it % log_every == 0:
             with torch.inference_mode():
                 elapsed = time.time() - t0
                 single = evaluate(LeducEnv, agent0, agent1, episodes=120)
-                both = evaluate_both_seats(LeducEnv, agent0, agent1, episodes=240)
+                both   = evaluate_both_seats(LeducEnv, agent0, agent1, episodes=240)
+
+                # SD-CFR evaluation using snapshots (if we have any)
+                if len(sdcfr_opp0._weights) > 0 and len(sdcfr_opp1._weights) > 0:
+                    sd_single = evaluate_sdcfr(LeducEnv, sdcfr_opp0, sdcfr_opp1, episodes=120)
+                    sd_both   = evaluate_sdcfr_both_seats(LeducEnv, sdcfr_opp0, sdcfr_opp1, episodes=240)
+                    print(f"   [SD-CFR] single {sd_single}  both {sd_both}")
+                else:
+                    sdcfr_msg = ""
+
             print(
                 f"[{it:05d}] | {elapsed:7.1f}s | "
                 f"{m0['loss']:7.3f}  {m1['loss']:7.3f} | "
                 f"{fmt_pair_counts(len(agent0.buffer), len(agent1.buffer)):>9} | "
                 f"{fmt_pct(single)} ({fmt_counts(single)})  |  "
-                f"{fmt_pct(both)} ({fmt_counts(both)})"
+                f"{fmt_pct(both)} ({fmt_counts(both)}){sdcfr_msg}"
             )
+
 
     total_time = time.time() - t0
     print("\n" + "="*80)

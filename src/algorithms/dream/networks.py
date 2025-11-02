@@ -80,3 +80,22 @@ class AverageNet(nn.Module):
                 probs = torch.where(no_legal, uniform, probs)
 
         return probs  # [B, A]
+
+
+class OpponentNet(nn.Module):
+    def __init__(self, in_dim, hidden=256, num_layers=2):
+        super().__init__()
+        layers = []
+        d = in_dim
+        for _ in range(num_layers):
+            layers += [nn.Linear(d, hidden), nn.ReLU()]
+            d = hidden
+        self.body = nn.Sequential(*layers)
+        self.logits = nn.Linear(d, 1024)  # max_action_count; you already mask
+    def forward(self, x, legal_mask):
+        h = self.body(x)
+        logits = self.logits(h)
+        # mask invalid actions to -inf before softmax
+        logits = logits.masked_fill(~legal_mask.bool(), float('-inf'))
+        probs = torch.softmax(logits, dim=-1)
+        return probs, logits

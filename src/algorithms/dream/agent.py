@@ -22,14 +22,14 @@ class DreamAgent:
         obs_dim: int,
         act_dim: int,
         lr: float = 1e-4,
-        lr_q: float = 1e-4,
+        lr_q: float = 5e-5,
         lr_avg: float = 1e-4,
         device: str = "cpu",
         max_grad_norm: float = 5.0,
         hidden: int = 256,
         layers: int = 2,
         adv_clip: float = 6.0,
-        q_target_tau: float = 0.01,
+        q_target_tau: float = 0.02,
         gamma: float = 1.0,
     ):
         self.device = torch.device(device)
@@ -42,7 +42,7 @@ class DreamAgent:
         self.use_avg_net = False
 
         # Q targets & regularization (kept from your code)
-        self.q_target_clip = 2.0
+        self.q_target_clip = None
         self.q_output_l2 = 3e-4
 
         # --- Networks ---
@@ -72,25 +72,25 @@ class DreamAgent:
     # Policy utilities
     # ------------------------------------------------------------
     def policy(self, obs, mask, use_average=True):
-        if not getattr(self, "use_avg_net", False):
-            return self._regret_matching(obs, mask)
-        if use_average:
-            obs_t = torch.from_numpy(obs.astype(np.float32)).unsqueeze(0).to(self.device)
+        if self.use_avg_net and use_average and (self.avg_net is not None):
+            obs_t  = torch.from_numpy(obs.astype(np.float32)).unsqueeze(0).to(self.device)
             mask_t = torch.from_numpy(mask.astype(np.float32)).unsqueeze(0).to(self.device)
             with torch.inference_mode():
                 pi = self.avg_net(obs_t, mask_t).squeeze(0).cpu().numpy()
-
-            # Normalize over legal actions defensively
-            legal = np.where(mask > 0)[0]
+            # normalize over legal
+            legal = (mask > 0)
             out = np.zeros_like(pi, dtype=np.float32)
             s = float(pi[legal].sum())
-            if s > 1e-12 and len(legal) > 0:
-                out[legal] = pi[legal] / s
-            elif len(legal) > 0:
-                out[legal] = 1.0 / len(legal)
+            out[legal] = pi[legal] / s if (s > 1e-12 and legal.any()) else (1.0 / max(1, int(legal.sum())))
             return out
 
-        return self._regret_matching(obs, mask)
+        # fallback: normalized regret matching
+        pi = self._regret_matching(obs, mask)
+        legal = (mask > 0)
+        out = np.zeros_like(pi, dtype=np.float32)
+        s = float(pi[legal].sum())
+        out[legal] = pi[legal] / s if (s > 1e-12 and legal.any()) else (1.0 / max(1, int(legal.sum())))
+        return out
 
     def act(self, obs: np.ndarray, mask: np.ndarray, use_average: bool = True) -> int:
         legal = np.where(mask > 0)[0]
@@ -186,6 +186,11 @@ class DreamAgent:
                 obs_here, mask_here = obs.copy(), mask.copy()
                 pi_here = rm_policy(obs_here, mask_here)
 
+                mu_here = pi_here.copy()
+
+                legal_idx = np.where(mask_here > 0)[0]
+                a = int(np.random.choice(legal_idx, p=mu_here[legal_idx]))
+
                 # Importance weight for this infoset I (opponents × chance to I)
                 linear_w = float(reach_target) * float(self.iter_count)
 
@@ -197,8 +202,7 @@ class DreamAgent:
                         weight=linear_w,
                     ))
 
-                # Sample our action from current policy (no epsilon)
-                a = int(np.random.choice(np.where(mask_here > 0)[0], p=pi_here[mask_here > 0]))
+                w_IS = 1.0 if strict_on_policy else (reach_target / max(reach_sampling, 1e-12))
 
                 # Execute our action
                 prev_obs = obs.copy()
@@ -257,11 +261,9 @@ class DreamAgent:
                     ret_g=float(r_immediate),
                     iter_t=self.iter_count,
                 ))
-                w_IS = 1.0 if strict_on_policy else (reach_target / max(reach_sampling, 1e-12))
-                if not strict_on_policy:
-                    pa = float(pi_here[a])                     # mu(a|I)
-                    w_IS *= 1.0 / max(pa, 1e-12)               # multiply by 1/mu(a|I)
-                decisions.append((obs_here, mask_here, a, pi_here, float(w_IS)))
+
+
+                decisions.append((obs_here, mask_here, a, pi_here, mu_here, float(w_IS)))
 
             else:
                 # Opponent step at the very beginning (rare but possible)
@@ -281,20 +283,27 @@ class DreamAgent:
 
         # ---------- build DREAM advantages (Problem A) with IS weight ----------
         returns = payoff
-        for (obs_s, mask_s, a_s, pi_s, w_I) in reversed(decisions):
-            # Q baseline
+        for (obs_s, mask_s, a_s, pi_s, mu_s, w_I) in reversed(decisions):
+            # 1) Baseline Q
             obs_t = torch.from_numpy(obs_s.astype(np.float32)).unsqueeze(0).to(self.device)
             with torch.inference_mode():
                 q_vals = self.q_net(obs_t).squeeze(0).cpu().numpy()
 
-            X = q_vals.copy()
-            X[a_s] = returns
-            X_minus_B = X - q_vals
-            center = float((pi_s * X_minus_B * mask_s).sum())
-            hatA = (X_minus_B - center) * mask_s
+            # 2) Control-variate Q-hat with behavior prob μ
+            delta = returns - q_vals[a_s]                    # G - B(I,a_s)
+            inv_mu = 1.0 / max(mu_s[a_s], 1e-12)            # use μ, not π, off-policy safe
+            Q_hat = q_vals.copy()
+            Q_hat[a_s] = q_vals[a_s] + inv_mu * delta
 
-            # Apply IS weight if off-policy; otherwise this is a no-op (=1)
-            hatA *= float(w_I)
+            # 3) Value under target π (mask-normalized just in case)
+            pi_masked = pi_s * mask_s
+            z = float(pi_masked.sum())
+            pi_tilde = pi_masked / max(z, 1e-12)
+            v_hat = float((pi_tilde * Q_hat * mask_s).sum())
+
+            # 4) Advantage and counterfactual weighting
+            hatA = (Q_hat - v_hat) * mask_s
+            hatA *= float(w_I)                               # opp×chance reach ratio to I
 
             if self.adv_clip is not None:
                 hatA = np.clip(hatA, -self.adv_clip, self.adv_clip)
@@ -406,6 +415,12 @@ class DreamAgent:
     def increment_iteration(self):
         self.iter_count += 1
 
+    
+    def export_regret_snapshot(self):
+        """Return (iter_t, state_dict) for SD-CFR snapshots."""
+        return self.iter_count, self.regret_net.state_dict()
+
+
     def policy_from_avg_net(self, obs, mask):
         obs_t = torch.from_numpy(obs.astype(np.float32)).unsqueeze(0).to(self.device)
         mask_t = torch.from_numpy(mask.astype(np.float32)).unsqueeze(0).to(self.device)
@@ -413,10 +428,6 @@ class DreamAgent:
             return self.avg_net(obs_t, mask_t).squeeze(0).cpu().numpy()
 
     def _regret_matching(self, obs, mask):
-        """
-        Regret matching on **predicted advantages** (DREAM):
-        π(a) ∝ max(Â(a), 0); if all ≤ 0, uniform over legal.
-        """
         o = torch.from_numpy(obs.astype(np.float32)).unsqueeze(0).to(self.device)
         with torch.inference_mode():
             adv = self.regret_net(o).squeeze(0).cpu().numpy()
@@ -425,18 +436,23 @@ class DreamAgent:
         positive = np.maximum(adv, 0.0)
 
         # tiny prior to avoid zero-prob sinks
+        legal = (mask > 0).astype(np.float32)
         eta = 5e-3 / np.sqrt(max(1, self.iter_count))
-        prior = (mask > 0).astype(np.float32)
+        rm = positive + eta * legal   # unnormalized regret-matching scores on legal actions
 
-        dist = positive + eta * prior
-        dist *= prior
-        s = dist.sum()
-        if s <= 0:
-            n = prior.sum()
-            dist = prior / n if n > 0 else prior
+        # uniform on legal actions
+        if legal.sum() > 0:
+            uniform = legal / legal.sum()
         else:
-            dist /= s
-        return dist.astype(np.float32)
+            uniform = legal
+
+        # exploration schedule (strong early, decays)
+        eps0, eps_min, T = 0.10, 0.01, 1500
+        eps = max(eps_min, eps0 * (1 - self.iter_count / T))
+
+        dist = (1 - eps) * rm + eps * uniform   # still unnormalized
+        return dist
+
 
     def _ema(self, prev, val, beta=0.9):
         return val if prev is None else beta * prev + (1 - beta) * val

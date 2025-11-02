@@ -16,6 +16,10 @@ RegretBuffer = buffers.RegretBuffer
 QBuffer = buffers.QBuffer
 QTransition = buffers.QTransition
 
+from .agent import DreamAgent
+from .networks import RegretNet, QNet, AverageNet, OpponentNet
+from .sdcfr import SDCFROpponent, evaluate_sdcfr, evaluate_sdcfr_both_seats
+
 __all__ = [
     "set_seed",
     "DreamAgent",
