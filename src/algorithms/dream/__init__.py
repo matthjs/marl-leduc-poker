@@ -8,11 +8,11 @@ DreamAgent = agent.DreamAgent
 
 # Expose network components
 MLP = networks.MLP
-AdvantageNet = networks.AdvantageNet
+RegretNet = networks.RegretNet
 
 # Expose buffer components
-AdvantageSample = buffers.AdvantageSample
-AdvantageBuffer = buffers.AdvantageBuffer
+RegretSample = buffers.RegretSample
+RegretBuffer = buffers.RegretBuffer
 QBuffer = buffers.QBuffer
 QTransition = buffers.QTransition
 
@@ -20,9 +20,9 @@ __all__ = [
     "set_seed",
     "DreamAgent",
     "MLP",
-    "AdvantageNet",
-    "AdvantageSample",
-    "AdvantageBuffer",
+    "RegretNet",
+    "RegretSample",
+    "RegretBuffer",
     "QBuffer", 
     "QTransition", 
 ]

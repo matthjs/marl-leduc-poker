@@ -175,7 +175,7 @@ def main(
     agent1.use_avg_net = True
 
     # Sync initialization
-    agent1.adv_net.load_state_dict(agent0.adv_net.state_dict())
+    agent1.regret_net.load_state_dict(agent0.regret_net.state_dict())
     agent1.q_net.load_state_dict(agent0.q_net.state_dict())
 
     opp0 = AvgPolicyOpponent(agent1)

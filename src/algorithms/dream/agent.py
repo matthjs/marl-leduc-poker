@@ -6,18 +6,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from copy import deepcopy
 
-
-from .networks import AdvantageNet, QNet, AverageNet
+from .networks import RegretNet, QNet, AverageNet
 from .buffers import (
-    AdvantageBuffer, AdvantageSample,
+    RegretBuffer, RegretSample,   # NOTE: RegretSample must have fields: obs, mask, adv, iter_t
     QBuffer, QTransition,
     PolicyBuffer, PolicySample
 )
 
-
 class DreamAgent:
     """
-    Model-free deep regret minimization agent with advantage baselines.
+    Model-free deep regret minimization agent with advantage baselines (DREAM-style).
     """
     def __init__(
         self,
@@ -42,33 +40,33 @@ class DreamAgent:
         self.q_target_tau = q_target_tau
         self.gamma = gamma
         self.use_avg_net = False
-        self.q_target_clip = 2.0    
-        self.q_output_l2 = 3e-4     
+
+        # Q targets & regularization (kept from your code)
+        self.q_target_clip = 2.0
+        self.q_output_l2 = 3e-4
 
         # --- Networks ---
-        self.adv_net = AdvantageNet(obs_dim, act_dim, hidden=hidden, layers=layers).to(self.device)
+        self.regret_net = RegretNet(obs_dim, act_dim, hidden=hidden, layers=layers).to(self.device)
         self.q_net = QNet(obs_dim, act_dim, hidden=hidden, layers=layers).to(self.device)
         self.q_target_net = deepcopy(self.q_net).to(self.device).eval()
         self.avg_net = AverageNet(obs_dim, act_dim, hidden=hidden, layers=layers).to(self.device)
 
         # --- Optimizers ---
-        self.adv_opt = torch.optim.Adam(self.adv_net.parameters(), lr=lr)
+        self.regret_opt = torch.optim.Adam(self.regret_net.parameters(), lr=lr)
         self.q_opt = torch.optim.Adam(self.q_net.parameters(), lr=lr_q)
         self.avg_opt = torch.optim.Adam(self.avg_net.parameters(), lr=lr_avg)
 
         # --- Buffers ---
-        self.buffer = AdvantageBuffer()
+        self.buffer = RegretBuffer()
         self.q_buffer = QBuffer()
         self.policy_buffer = PolicyBuffer()
 
         # --- Other ---
         self.iter_count: int = 1
 
-
-        self.log_every = 100          # print diagnostics every N train_step() calls
-        self._q_log_step = 0          # internal counter for printing
-        self._q_ema = {"td": None, "q": None, "tgt": None}  # EMAs for smoother logs
-
+        self.log_every = 100
+        self._q_log_step = 0
+        self._q_ema = {"td": None, "q": None, "tgt": None}
 
     # ------------------------------------------------------------
     # Policy utilities
@@ -81,7 +79,17 @@ class DreamAgent:
             mask_t = torch.from_numpy(mask.astype(np.float32)).unsqueeze(0).to(self.device)
             with torch.inference_mode():
                 pi = self.avg_net(obs_t, mask_t).squeeze(0).cpu().numpy()
-            return pi
+
+            # Normalize over legal actions defensively
+            legal = np.where(mask > 0)[0]
+            out = np.zeros_like(pi, dtype=np.float32)
+            s = float(pi[legal].sum())
+            if s > 1e-12 and len(legal) > 0:
+                out[legal] = pi[legal] / s
+            elif len(legal) > 0:
+                out[legal] = 1.0 / len(legal)
+            return out
+
         return self._regret_matching(obs, mask)
 
     def act(self, obs: np.ndarray, mask: np.ndarray, use_average: bool = True) -> int:
@@ -100,134 +108,212 @@ class DreamAgent:
     # ------------------------------------------------------------
     # Outcome sampling trajectory (real environment)
     # ------------------------------------------------------------
-    def outcome_sampling_traj(self, env, player_i: int, opponent=None) -> float:
+    def outcome_sampling_traj(self, env, player_i: int, opponent=None,
+                            strict_on_policy: bool = True) -> float:
         """
-        Hybrid MC/TD counterfactual rollout (Option B) WITHOUT epsilon-greedy:
-        - No ε-mixing anywhere (opponent or self)
-        - Behavior policy == target policy at our decisions → IS weight ρ = 1
-        - Backward MC processing; Q-net for counterfactuals
+        Outcome-sampling rollout that:
+        (1) builds DREAM per-iteration advantages (Problem A),
+        (2) stores TD transitions for the Q baseline (Problem C),
+        (3) fixes reach / importance weights (Problem D).
+
+        If strict_on_policy=True (default), opponents & chance are sampled from their
+        target distributions → IS ratio = 1, so no variance blow-up and no brittle constants.
+        If you pass strict_on_policy=False, we compute w(I) = target_reach / sampling_reach
+        over opponent & chance to the traverser infoset I and weight Â by w(I).
         """
+        # ---------- tiny helpers ----------
+        def rm_policy(o, m):
+            pi = self._regret_matching(o, m)
+            legal = (m > 0)
+            s = float(pi[legal].sum())
+            if s <= 0:
+                pi = legal.astype(np.float32) / max(1, int(legal.sum()))
+            else:
+                pi[~legal] = 0.0
+                pi /= s
+            return pi
+
+        def opp_target_policy(o, m):
+            # "target" opponent policy (what CFR evaluates against).
+            if opponent is not None:
+                return opponent.policy(o, m, use_average=getattr(opponent, "use_avg_net", False))
+            return self.policy(o, m, use_average=getattr(self, "use_avg_net", False))
+
+        def opp_behavior_policy(o, m):
+            # If strict_on_policy, behavior == target (keeps IS=1). Otherwise, you
+            # may define a different behavior policy here (e.g., ε-greedy).
+            if strict_on_policy:
+                return opp_target_policy(o, m)
+            # Example off-policy behavior: same as target by default; customize if needed.
+            return opp_target_policy(o, m)
+
+        def chance_prob(prev_obs, action, next_obs):
+            """
+            Returns (p_target, p_behavior) for the chance move. If your env provides
+            exact chance probabilities, plug them here. Otherwise, return (1.0, 1.0).
+            """
+            # Try a few common env hooks:
+            if hasattr(env, "chance_prob"):
+                p = float(env.chance_prob(prev_obs, action, next_obs))
+                return (p, p) if strict_on_policy else (p, p)  # adjust if behavior differs
+            if hasattr(env, "last_chance_prob"):
+                p = float(env.last_chance_prob())
+                return (p, p) if strict_on_policy else (p, p)
+            # Fallback: unknown chance → assume matched target/behavior
+            return (1.0, 1.0)
+
+        def is_chance_turn():
+            # Generic detector for chance node; adapt if your env exposes it differently.
+            # Many poker envs fold chance into "opponent" turns, in which case leave False.
+            return getattr(env, "current", None) == -1 or getattr(env, "is_chance", False)
+
+        # ---------- rollout ----------
         env.reset()
         obs, mask, done = env.last()
-        opp_reach = 1.0
 
-        prob_private = 1.0 / (6.0 * 5.0)
-        prob_public  = 1.0 / 4.0
-        traj = []
-        q_transitions = []
+        # For IS: reach trackers up to the current node (opponents × chance only)
+        reach_sampling = 1.0
+        reach_target   = 1.0
 
-        # ---------------- rollout phase ----------------
+        # We’ll keep our decisions for later (to build advantages) and store
+        # the w(I) that applies at each infoset.
+        decisions = []
+
+        # Also collect Q transitions online (Problem C)
         while not done:
-            p = env.current
-            stage = env.stage
-            obs_here, mask_here = obs.copy(), mask.copy()
+            if env.current == player_i:
+                # ---- traverser infoset I ----
+                obs_here, mask_here = obs.copy(), mask.copy()
+                pi_here = rm_policy(obs_here, mask_here)
 
-            if p == player_i:
-                # Our move: sample from regret-matching policy (no epsilon)
-                a = self.act(obs, mask, use_average=False)
-                rm = self._regret_matching(obs_here, mask_here)
-                chance_w = prob_private if stage == 0 else prob_private * prob_public
+                # Importance weight for this infoset I (opponents × chance to I)
+                linear_w = float(reach_target) * float(self.iter_count)
 
-                traj.append({
-                    "obs": obs_here,
-                    "mask": mask_here,
-                    "action": a,
-                    "opp_reach": opp_reach,
-                    "chance_reach": chance_w,
-                    "stage": stage,
-                    "policy": rm,
-                })
-
-                # Linear CFR weighting for average policy network
                 if getattr(self, "use_avg_net", False):
-                    linear_w = opp_reach * chance_w * self.iter_count
                     self.policy_buffer.push(PolicySample(
                         obs=obs_here.astype(np.float32),
                         mask=mask_here.astype(np.float32),
-                        pi=rm,
+                        pi=pi_here.astype(np.float32),   # current RM policy
                         weight=linear_w,
                     ))
-            else:
-                # Opponent move: sample from opponent's average policy (no epsilon)
-                legal = np.where(mask > 0)[0]
-                if opponent:
-                    dist_no_eps = opponent.policy(obs, mask, use_average=getattr(opponent, "use_avg_net", False))
+
+                # Sample our action from current policy (no epsilon)
+                a = int(np.random.choice(np.where(mask_here > 0)[0], p=pi_here[mask_here > 0]))
+
+                # Execute our action
+                prev_obs = obs.copy()
+                env.step(a)
+                obs, mask, done = env.last()
+
+                # Roll forward opponents/chance to next traverser decision or terminal
+                while not done and env.current != player_i:
+                    if is_chance_turn():
+                        # CHANCE: sample from its (behavior) distribution; update reach
+                        # We don't know the distribution explicitly, so we assume the env
+                        # samples an outcome. If env exposes prob for the sampled outcome,
+                        # chance_prob(prev_state, action, next_state) should return it.
+                        # We need the realized action to get its prob; many envs don't expose
+                        # "chance action id". If not available, we assume matched target/behavior.
+                        p_t, p_b = chance_prob(prev_obs, None, obs)  # action unknown → best effort
+                        reach_sampling *= float(p_b)
+                        reach_target   *= float(p_t)
+                        # advance already happened above when env sampled chance into `obs`
+                        pass
+                    else:
+                        # OPPONENT: compute behavior and target policy over legal actions
+                        pi_beh = opp_behavior_policy(obs, mask)
+                        pi_tgt = opp_target_policy(obs, mask)
+                        legal = np.where(mask > 0)[0]
+                        a_opp = int(np.random.choice(legal, p=pi_beh[legal]))
+                        # update reach
+                        reach_sampling *= float(pi_beh[a_opp])
+                        reach_target   *= float(pi_tgt[a_opp])
+                        # step
+                        prev_obs = obs.copy()
+                        env.step(a_opp)
+                        obs, mask, done = env.last()
+
+                # ---- push Q transition (Expected SARSA) ----
+                if done:
+                    r0, r1 = env.get_rewards()
+                    payoff = float([r0, r1][player_i])
+                    r_immediate = payoff
+                    next_obs  = np.zeros_like(obs,  dtype=np.float32)
+                    next_mask = np.zeros_like(mask, dtype=np.float32)
+                    pi_next   = np.zeros_like(mask, dtype=np.float32)
                 else:
-                    dist_no_eps = self.policy(obs, mask, use_average=getattr(self, "use_avg_net", False))
-                a = int(np.random.choice(legal, p=dist_no_eps[legal]))
-                opp_reach *= float(dist_no_eps[a])
+                    r_immediate = 0.0
+                    next_obs  = obs.astype(np.float32)
+                    next_mask = mask.astype(np.float32)
+                    pi_next   = rm_policy(obs, mask).astype(np.float32)
 
-            env.step(a)
-            obs, mask, done = env.last()
+                self.q_buffer.push(QTransition(
+                    obs=obs_here.astype(np.float32),
+                    action=int(a),
+                    next_obs=next_obs,
+                    done=bool(done),
+                    next_mask=next_mask,
+                    pi_next=pi_next,
+                    ret_g=float(r_immediate),
+                    iter_t=self.iter_count,
+                ))
+                w_IS = 1.0 if strict_on_policy else (reach_target / max(reach_sampling, 1e-12))
+                # Save info to build DREAM advantages later (includes w_I for this infoset)
+                decisions.append((obs_here, mask_here, a, pi_here, float(w_IS)))
 
-        # terminal payoff
+            else:
+                # Opponent step at the very beginning (rare but possible)
+                pi_beh = opp_behavior_policy(obs, mask)
+                pi_tgt = opp_target_policy(obs, mask)
+                legal = np.where(mask > 0)[0]
+                a_opp = int(np.random.choice(legal, p=pi_beh[legal]))
+                reach_sampling *= float(pi_beh[a_opp])
+                reach_target   *= float(pi_tgt[a_opp])
+                prev_obs = obs.copy()
+                env.step(a_opp)
+                obs, mask, done = env.last()
+
+        # terminal payoff for advantages
         r0, r1 = env.get_rewards()
         payoff = float([r0, r1][player_i])
 
-        # ---------------- backward pass ----------------
+        # ---------- build DREAM advantages (Problem A) with IS weight ----------
         returns = payoff
-        cumulative_rho = 1.0  # on-policy ⇒ stays 1.0
-
-        for step in reversed(traj):
-            obs_s, mask_s = step["obs"], step["mask"]
-            a_s = step["action"]
-            opp_w = step["opp_reach"]
-            ch_w  = step["chance_reach"]
-
-            # Q-values from network
+        for (obs_s, mask_s, a_s, pi_s, w_I) in reversed(decisions):
+            # Q baseline
             obs_t = torch.from_numpy(obs_s.astype(np.float32)).unsqueeze(0).to(self.device)
             with torch.inference_mode():
                 q_vals = self.q_net(obs_t).squeeze(0).cpu().numpy()
 
-            # (kept for completeness / future off-policy tweaks)
-            pi_target = self._regret_matching(obs_s, mask_s)
-            pi_behavior = pi_target
-            rho_t = 1.0
-            cumulative_rho *= rho_t  # remains 1.0
+            X = q_vals.copy()
+            X[a_s] = returns
+            X_minus_B = X - q_vals
+            center = float((pi_s * X_minus_B * mask_s).sum())
+            hatA = (X_minus_B - center) * mask_s
 
-            q_played_mc = returns  # MC return for the played action
+            # Apply IS weight if off-policy; otherwise this is a no-op (=1)
+            hatA *= float(w_I)
 
-            v_baseline = (pi_target * q_vals * mask_s).sum()
+            if self.adv_clip is not None:
+                hatA = np.clip(hatA, -self.adv_clip, self.adv_clip)
 
-            # Regret for all legal actions: Q(s,a) - Q(s,a_played), scaled by opp reach
-            legal = np.where(mask_s > 0)[0]
-            for a in legal:
-                q_estimate = q_played_mc if a == a_s else q_vals[a]
-                regret = (q_estimate - v_baseline) * cumulative_rho * opp_w * ch_w
-                regret = float(np.clip(regret, -self.adv_clip, self.adv_clip))
-
-                self.buffer.push(AdvantageSample(
-                    obs_s.astype(np.float32),
-                    mask_s.astype(np.float32),
-                    int(a),
-                    float(regret),
-                    self.iter_count,
-                ))
-
-            # Q-learning transition for the played action (terminal from this infoset view)
-            self.q_buffer.push(QTransition(
+            self.buffer.push(RegretSample(
                 obs=obs_s.astype(np.float32),
-                action=int(a_s),
-                next_obs=np.zeros_like(obs_s, dtype=np.float32),
-                done=True,
-                next_mask=np.zeros(self.act_dim, dtype=np.float32),
-                pi_next=np.zeros(self.act_dim, dtype=np.float32),
-                ret_g=q_played_mc,
+                mask=mask_s.astype(np.float32),
+                adv=hatA.astype(np.float32),
                 iter_t=self.iter_count,
             ))
 
-            # For games with intermediate rewards, you'd do:
-            # returns = step_reward + self.gamma * returns
-
         return payoff
+
 
     # ------------------------------------------------------------
     # Training
     # ------------------------------------------------------------
     def train_step(self, batch_size: int = 2048):
-        metrics = {"adv_loss": 0.0, "q_loss": 0.0}
+        metrics = {"regret_loss": 0.0, "q_loss": 0.0}
 
-        # Q-network
+        # ---------------- Q-network (unchanged for A-fix) ----------------
         if len(self.q_buffer) > 0:
             q_batch = self.q_buffer.sample(batch_size)
             obs = torch.from_numpy(np.stack([b.obs for b in q_batch]).astype(np.float32)).to(self.device)
@@ -243,7 +329,6 @@ class DreamAgent:
                 q_next_all = self.q_target_net(next_obs) * next_mask
                 v_next = (pi_next * q_next_all).sum(dim=1)
                 target = torch.where(dones, rets, rets + self.gamma * v_next)
-            
                 if self.q_target_clip is not None:
                     target = target.clamp(-self.q_target_clip, self.q_target_clip)
 
@@ -256,69 +341,39 @@ class DreamAgent:
             self.q_opt.step()
             metrics["q_loss"] = q_loss.item()
 
-            # ---------- Q-network diagnostics ----------
-            with torch.no_grad():
-                # Basic stats
-                q_mean = q_sa.mean().item()
-                q_std  = q_sa.std().item()
-                tgt_mean = target.mean().item()
-                tgt_std  = target.std().item()
-
-                td = (q_sa - target)
-                td_abs_mean = td.abs().mean().item()
-                td_abs_max  = td.abs().max().item()
-
-                # How many Qs fall in a plausible payoff range for Leduc ([-2, 2])?
-                in_range = ((q_sa >= -2.0) & (q_sa <= 2.0)).float().mean().item()
-
-                # Smooth EMAs for readability
-                self._q_ema["td"]  = self._ema(self._q_ema["td"],  td_abs_mean)
-                self._q_ema["q"]   = self._ema(self._q_ema["q"],   q_mean)
-                self._q_ema["tgt"] = self._ema(self._q_ema["tgt"], tgt_mean)
-
-                # Print every N steps
-                self._q_log_step += 1
-                tgt_in_range = ((target >= -2.0) & (target <= 2.0)).float().mean().item()
-                if (self._q_log_step % self.log_every) == 0:
-                    print(
-                        "[Q] mean={:.3f}±{:.3f} (Q in[-2,2]={:.1f}%) | "
-                        "target mean={:.3f}±{:.3f} (tgt in[-2,2]={:.1f}%) | "
-                        "TD |mean|={:.3f} (EMA {:.3f}) max={:.3f}".format(
-                            q_mean, q_std, 100.0 * in_range,
-                            tgt_mean, tgt_std, 100.0 * tgt_in_range,
-                            td_abs_mean, (self._q_ema['td'] or td_abs_mean), td_abs_max
-                        )
-                    )
-
+            # soft target update
             for p, t in zip(self.q_net.parameters(), self.q_target_net.parameters()):
                 t.data.mul_(1 - self.q_target_tau).add_(self.q_target_tau * p.data)
 
-        # Advantage/Regret network
+        # ---------------- Advantage/Regret network (A-fix) ----------------
         if len(self.buffer) > 0:
-            adv_batch = self.buffer.sample(batch_size)
-            obs  = torch.from_numpy(np.stack([b.obs for b in adv_batch]).astype(np.float32)).to(self.device)
-            acts = torch.from_numpy(np.asarray([b.action for b in adv_batch])).long().to(self.device)
-            target_vals = np.array(
-                [getattr(b, "adv_target_v", getattr(b, "adv", 0.0)) for b in adv_batch],
-                dtype=np.float32
-            )
-            regret_targets = torch.from_numpy(target_vals).to(self.device)
+            batch = self.buffer.sample(batch_size)
+            obs  = torch.from_numpy(np.stack([b.obs  for b in batch]).astype(np.float32)).to(self.device)         # [B, obs_dim]
+            mask = torch.from_numpy(np.stack([b.mask for b in batch]).astype(np.float32)).to(self.device)         # [B, A]
+            targ = torch.from_numpy(np.stack([b.adv  for b in batch]).astype(np.float32)).to(self.device)         # [B, A]
+            iters = torch.tensor([b.iter_t for b in batch], dtype=torch.float32, device=self.device)              # [B]
 
-            iter_weights = torch.tensor([b.iter_t for b in adv_batch], dtype=torch.float32, device=self.device)
+            pred = self.regret_net(obs)                                                                           # [B, A]
 
-            pred_regret = self.adv_net(obs).gather(1, acts.unsqueeze(1)).squeeze(1)
-            huber_loss = F.huber_loss(pred_regret, regret_targets, reduction='none')
-            regret_loss = (iter_weights * huber_loss).sum() / (iter_weights.sum().clamp_min(1e-8))
+            # mask illegal actions
+            pred = pred * mask
+            targ = targ * mask
 
-            self.adv_opt.zero_grad(set_to_none=True)
-            regret_loss.backward()
-            grad_norm = nn.utils.clip_grad_norm_(self.adv_net.parameters(), self.max_grad_norm)
-            if grad_norm > 10.0:
-                print(f"[warn] adv grad_norm high: {float(grad_norm):.2f}")
-            self.adv_opt.step()
-            metrics["adv_loss"] = float(regret_loss.item())
+            # Linear-CFR iteration weights (normalize for stability)
+            w = iters / (iters.mean().clamp_min(1.0))
+            w = w.view(-1, 1)                                                                                    # [B,1]
 
-        # Average policy network
+            loss = ((pred - targ) ** 2)
+            loss = (loss * w).sum(dim=1).mean()
+
+            self.regret_opt.zero_grad(set_to_none=True)
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.regret_net.parameters(), self.max_grad_norm)
+            self.regret_opt.step()
+
+            metrics["regret_loss"] = float(loss.item())
+
+        # ---------------- Average policy net (optional DREAM variant) ----------------
         if getattr(self, "use_avg_net", False) and hasattr(self, "policy_buffer") and len(self.policy_buffer) > 0:
             pol_batch = self.policy_buffer.sample(batch_size)
             obs_tensor  = torch.from_numpy(np.stack([b.obs  for b in pol_batch]).astype(np.float32)).to(self.device)
@@ -339,7 +394,8 @@ class DreamAgent:
         else:
             metrics["avg_loss"] = 0.0
 
-        metrics["loss"] = metrics["adv_loss"] + metrics["q_loss"] + metrics["avg_loss"]
+        #print(f"[dbg] avg_buf_len={len(self.policy_buffer)} avg_loss={metrics.get('avg_loss', 0):.6f}")
+        metrics["loss"] = metrics["regret_loss"] + metrics["q_loss"] + metrics["avg_loss"]
         return metrics
 
     # ------------------------------------------------------------
@@ -355,15 +411,22 @@ class DreamAgent:
             return self.avg_net(obs_t, mask_t).squeeze(0).cpu().numpy()
 
     def _regret_matching(self, obs, mask):
+        """
+        Regret matching on **predicted advantages** (DREAM):
+        π(a) ∝ max(Â(a), 0); if all ≤ 0, uniform over legal.
+        """
         o = torch.from_numpy(obs.astype(np.float32)).unsqueeze(0).to(self.device)
         with torch.inference_mode():
-            adv = self.adv_net(o).squeeze(0).cpu().numpy()
+            adv = self.regret_net(o).squeeze(0).cpu().numpy()
 
+        adv = adv * mask
+        positive = np.maximum(adv, 0.0)
 
-        pos = np.maximum(adv, 0.0)
+        # tiny prior to avoid zero-prob sinks
         eta = 5e-3 / np.sqrt(max(1, self.iter_count))
         prior = (mask > 0).astype(np.float32)
-        dist = pos + eta * prior  # Ensures exploration
+
+        dist = positive + eta * prior
         dist *= prior
         s = dist.sum()
         if s <= 0:
@@ -373,9 +436,5 @@ class DreamAgent:
             dist /= s
         return dist.astype(np.float32)
 
-    def _obs_key(self, obs: np.ndarray) -> bytes:
-        return np.asarray(obs, dtype=np.float32).tobytes()
-    
     def _ema(self, prev, val, beta=0.9):
         return val if prev is None else beta * prev + (1 - beta) * val
-

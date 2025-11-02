@@ -23,7 +23,7 @@ class MLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
-class AdvantageNet(nn.Module):
+class RegretNet(nn.Module):
     """Predicts per-action advantages A(obs)[a]."""
     def __init__(self, obs_dim: int, act_dim: int, hidden: int = 256, layers: int = 2):
         super().__init__()
