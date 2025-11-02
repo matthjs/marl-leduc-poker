@@ -41,7 +41,7 @@ class DreamAgent:
         self.gamma = gamma
         self.use_avg_net = False
 
-        # Q targets & regularization (kept from your code)
+        # Q targets & regularization
         self.q_target_clip = None
         self.q_output_l2 = 3e-4
 
@@ -117,7 +117,6 @@ class DreamAgent:
         (2) stores TD transitions for the Q baseline ,
         (3) fixes reach / importance weights .
         """
-        # ---------- tiny helpers ----------
 
         def _norm_over_legal(p, m):
             p = p * (m > 0).astype(np.float32)
@@ -141,7 +140,7 @@ class DreamAgent:
 
 
         def opp_behavior_policy(o, m):
-            # Lowest variance: behavior = target (so IS ratio for others stays 1)
+            # Lowest variance: behavior = target 
             return opp_target_policy(o, m)
 
         def rm_policy(o, m):
@@ -157,37 +156,29 @@ class DreamAgent:
 
         def chance_prob(prev_obs, action, next_obs):
             """
-            Returns (p_target, p_behavior) for the chance move. If your env provides
-            exact chance probabilities, plug them here. Otherwise, return (1.0, 1.0).
+            Returns (p_target, p_behavior) for the chance move.
             """
-            # Try a few common env hooks:
             if hasattr(env, "chance_prob"):
                 p = float(env.chance_prob(prev_obs, action, next_obs))
-                return (p, p) if strict_on_policy else (p, p)  # adjust if behavior differs
+                return (p, p) if strict_on_policy else (p, p)  
             if hasattr(env, "last_chance_prob"):
                 p = float(env.last_chance_prob())
                 return (p, p) if strict_on_policy else (p, p)
-            # Fallback: unknown chance → assume matched target/behavior
             return (1.0, 1.0)
 
         def is_chance_turn():
-            # Generic detector for chance node; adapt if your env exposes it differently.
-            # Many poker envs fold chance into "opponent" turns, in which case leave False.
             return getattr(env, "current", None) == -1 or getattr(env, "is_chance", False)
 
         # ---------- rollout ----------
         env.reset()
         obs, mask, done = env.last()
 
-        # For IS: reach trackers up to the current node (opponents × chance only)
         reach_sampling = 1.0
         reach_target   = 1.0
 
-        # We’ll keep our decisions for later (to build advantages) and store
-        # the w(I) that applies at each infoset.
+
         decisions = []
 
-        # Also collect Q transitions online (Problem C)
         while not done:
             if env.current == player_i:
                 # ---- traverser infoset I ----
@@ -220,12 +211,11 @@ class DreamAgent:
                 # Roll forward opponents/chance to next traverser decision or terminal
                 while not done and env.current != player_i:
                     if is_chance_turn():
-                        p_t, p_b = chance_prob(prev_obs, None, obs)  # action unknown → best effort
+                        p_t, p_b = chance_prob(prev_obs, None, obs) 
                         reach_sampling *= float(p_b)
                         reach_target   *= float(p_t)
                         pass
                     else:
-                        # OPPONENT: compute behavior and target policy over legal actions
                         pi_beh = opp_behavior_policy(obs, mask)
                         pi_tgt = opp_target_policy(obs, mask)
                         legal = np.where(mask > 0)[0]
@@ -266,7 +256,6 @@ class DreamAgent:
                 decisions.append((obs_here, mask_here, a, pi_here, mu_here, float(w_IS)))
 
             else:
-                # Opponent step at the very beginning (rare but possible)
                 pi_beh = opp_behavior_policy(obs, mask)
                 pi_tgt = opp_target_policy(obs, mask)
                 legal = np.where(mask > 0)[0]
@@ -283,7 +272,7 @@ class DreamAgent:
         r0, r1 = env.get_rewards()
         payoff = float([r0, r1][player_i])
 
-        # ---------- build DREAM advantages (Problem A) with IS weight ----------
+        # ---------- build DREAM advantages with IS weight ----------
         returns = payoff
         for (obs_s, mask_s, a_s, pi_s, mu_s, w_I) in reversed(decisions):
             # 1) Baseline Q
@@ -360,7 +349,6 @@ class DreamAgent:
 
         # ---------------- Advantage/Regret network (with optional Extra-Gradient) ----------------
         if len(self.buffer) > 0:
-            # --- a helper to build the loss exactly like you already do ---
             def regret_batch_and_loss():
                 batch = self.buffer.sample(batch_size)
                 obs  = torch.from_numpy(np.stack([b.obs  for b in batch]).astype(np.float32)).to(self.device)
@@ -378,7 +366,6 @@ class DreamAgent:
                 return loss, obs.shape[0]
 
             if not getattr(self, "use_extragrad", False):
-                # ======= ORIGINAL SINGLE-STEP =======
                 loss, _ = regret_batch_and_loss()
                 self.regret_opt.zero_grad(set_to_none=True)
                 loss.backward()
@@ -387,21 +374,16 @@ class DreamAgent:
                 metrics["regret_loss"] = float(loss.item())
 
             else:
-                # ======= EXTRA-GRADIENT PREDICTOR–CORRECTOR =======
-                # ---- predictor gradient at theta_t ----
                 loss1, _ = regret_batch_and_loss()
                 self.regret_opt.zero_grad(set_to_none=True)
                 loss1.backward()
 
-                # clone a temporary model and take a manual "predictor" step: theta_t -> tilde_theta
                 theta_tilde = deepcopy(self.regret_net).to(self.device).train()
                 with torch.no_grad():
                     for p_tilde, p in zip(theta_tilde.parameters(), self.regret_net.parameters()):
                         if p.grad is not None:
                             p_tilde.add_( - float(self.extragrad_alpha) * p.grad )
 
-                # ---- corrector gradient at tilde_theta ----
-                # optionally resample to B2 (recommended); if not, reuse same batch logic
                 def regret_loss_on(model):
                     batch = self.buffer.sample(batch_size) if self.extragrad_resample else self.buffer.sample(batch_size)
                     obs  = torch.from_numpy(np.stack([b.obs  for b in batch]).astype(np.float32)).to(self.device)
@@ -416,17 +398,15 @@ class DreamAgent:
 
                 # backprop on the temporary model to get ∇L(tilde_theta)
                 loss2 = regret_loss_on(theta_tilde)
-                # IMPORTANT: zero original grads; compute grads w.r.t. the temp model
                 self.regret_opt.zero_grad(set_to_none=True)
                 for p in theta_tilde.parameters():
                     if p.grad is not None: p.grad = None
                 loss2.backward()
 
-                # copy grads from temp model to the real model
                 for p, q in zip(self.regret_net.parameters(), theta_tilde.parameters()):
                     p.grad = None if q.grad is None else q.grad.detach().clone()
 
-                # now step the real optimizer with gradient evaluated at tilde_theta
+                # step the real optimizer with gradient evaluated at tilde_theta
                 nn.utils.clip_grad_norm_(self.regret_net.parameters(), self.max_grad_norm)
                 self.regret_opt.step()
                 metrics["regret_loss"] = float(loss2.item())
@@ -452,7 +432,6 @@ class DreamAgent:
         else:
             metrics["avg_loss"] = 0.0
 
-        #print(f"[dbg] avg_buf_len={len(self.policy_buffer)} avg_loss={metrics.get('avg_loss', 0):.6f}")
         metrics["loss"] = metrics["regret_loss"] + metrics["q_loss"] + metrics["avg_loss"]
         return metrics
 
@@ -485,7 +464,7 @@ class DreamAgent:
         # tiny prior to avoid zero-prob sinks
         legal = (mask > 0).astype(np.float32)
         eta = 5e-3 / np.sqrt(max(1, self.iter_count))
-        rm = positive + eta * legal   # unnormalized regret-matching scores on legal actions
+        rm = positive + eta * legal   
 
         # uniform on legal actions
         if legal.sum() > 0:
@@ -493,11 +472,10 @@ class DreamAgent:
         else:
             uniform = legal
 
-        # exploration schedule (strong early, decays)
         eps0, eps_min, T = 0.10, 0.01, 1500
         eps = max(eps_min, eps0 * (1 - self.iter_count / T))
 
-        dist = (1 - eps) * rm + eps * uniform   # still unnormalized
+        dist = (1 - eps) * rm + eps * uniform   
         return dist
 
 
